@@ -1,0 +1,41 @@
+app:
+  project_name: "Med-RAG"
+  debug: true
+
+kb:
+  chunk_size: 400
+  chunk_overlap: 80
+
+retrieval:
+  top_k_dense: 10
+  top_k_bm25: 10
+  top_k_merged: 6
+  max_docs_for_llm: 3
+  max_context_chars: 1200
+  use_reranker: false
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+models:
+  llm_provider: "local"
+  llm_model: "Qwen/Qwen2.5-7B-Instruct"
+  openai_model: "gpt-4o-mini"
+  embeddings: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  use_normalizer: false
+
+generation:
+  max_new_tokens: 220
+  temperature: 0.0
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.07
+
+pubmed:
+  enable: false
+  retmax: 8
+  years_back: 10
+  merge_with_local_kb: true
+
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  indices: "data/indices"
