@@ -1,67 +1,137 @@
 # -*- coding: utf-8 -*-
-# app/rag/add_stroke_chunks.py
+# app/rag/add_pubmed_stroke_chunks.py
 
-import os
 import json
+import re
+import yaml
 from pathlib import Path
+from tqdm import tqdm
 
-# مسار ملف الـ abstracts المنظّف
-RAW_FILE = Path("data/raw/pubmed_stroke_abstracts_clean.txt")
+# Load config to get chunk size/overlap
+with open("config.yaml", "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f) or {}
 
-# مجلد الـ KB اللي بيقرأ منو build_index.py
-KB_DIR = Path("app/kb/chunks")
-KB_DIR.mkdir(parents=True, exist_ok=True)
+KB_CFG = CFG.get("kb", {})
+CHUNK_SIZE = KB_CFG.get("chunk_size", 1000)
+CHUNK_OVERLAP = KB_CFG.get("chunk_overlap", 200)
 
+INPUT_FILE = Path("data/pubmed_subset/pubmed_subset.jsonl")
+CHUNKS_DIR = Path("app/kb/chunks")
+CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
-def simple_chunk(text: str, chunk_size: int = 700, overlap: int = 150):
-    """تقطيع النص لقطع متداخلة شوي (للاسترجاع)."""
-    if chunk_size <= 0:
-        chunk_size = 700
-    if overlap < 0:
-        overlap = 0
-    if overlap >= chunk_size:
-        overlap = chunk_size - 1
+# ---------- Stroke detection ----------
+STROKE_PATTERNS = [
+    r"\bstroke\b",
+    r"\bcva\b",
+    r"\bbrain attack\b",
+    r"\bcerebrovascular accident\b",
+    r"\bischemic stroke\b",
+    r"\bhemorrhagic stroke\b",
+    r"\bintracerebral hemorrhage\b",
+    r"\bsubarachnoid hemorrhage\b",
+    r"\bTIA\b",
+    r"\btransient ischemic attack\b",
+    r"\bcerebral infarction\b",
+    r"\bbrain infarction\b",
+    r"\bthrombectomy\b",
+    r"\bthrombolysis\b",
+    r"\bpost-stroke\b",
+]
+STROKE_RE = re.compile("|".join(STROKE_PATTERNS), re.IGNORECASE)
+
+# ---------- Posterior circulation keywords ----------
+POSTERIOR_KEYWORDS = [
+    r"\bvertebrobasilar\b",
+    r"\bposterior circulation\b",
+    r"\bbrainstem\b",
+    r"\bcerebellar\b",
+    r"\bvertigo\b",
+    r"\bdiplopia\b",
+    r"\bataxia\b",
+    r"\bdizziness\b",
+    r"\bcross sensory\b",
+    r"\balternating\b",
+    r"\bhoarseness\b",
+    r"\bdysphagia\b",
+]
+POSTERIOR_RE = re.compile("|".join(POSTERIOR_KEYWORDS), re.IGNORECASE)
+
+# ---------- Chunking ----------
+def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
 
     chunks = []
-    n = len(text)
     i = 0
+    n = len(text)
     while i < n:
-        end = min(i + chunk_size, n)
-        chunks.append(text[i:end])
-        if end >= n:
+        j = min(i + chunk_size, n)
+        chunks.append(text[i:j])
+        if j >= n:
             break
-        i = end - overlap
+        i = j - overlap
     return chunks
 
-
 def main():
-    if not RAW_FILE.exists():
-        raise SystemExit(f"❌ الملف غير موجود: {RAW_FILE}")
+    if not INPUT_FILE.exists():
+        raise SystemExit(f"❌ PubMed subset file not found: {INPUT_FILE}")
 
-    text = RAW_FILE.read_text(encoding="utf-8")
-    text = text.strip()
-    if not text:
-        raise SystemExit("❌ ملف الـ abstracts فارغ بعد التنظيف.")
+    # Remove old chunks
+    for f in CHUNKS_DIR.glob("*.json"):
+        f.unlink()
 
-    chunks = simple_chunk(text, chunk_size=700, overlap=150)
-    print(f"عدد الـ chunks الناتجة من النص: {len(chunks)}")
+    total = 0
+    kept = 0
+    chunk_count = 0
 
-    # نكتب كل chunk كـ ملف JSON منفصل في app/kb/chunks
-    for i, ch in enumerate(chunks, start=1):
-        rec = {
-            "id": f"stroke_local_{i}",
-            "title": "pubmed_stroke_abstracts",
-            "text": ch,
-            "source": str(RAW_FILE),
-        }
-        out_path = KB_DIR / f"stroke_local_{i}.json"
-        out_path.write_text(
-            json.dumps(rec, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    with INPUT_FILE.open("r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="Scanning PubMed subset"):
+            total += 1
+            try:
+                rec = json.loads(line)
+            except:
+                continue
 
-    print(f"✅ تم حفظ {len(chunks)} ملف JSON في: {KB_DIR}")
+            title = rec.get("title", "")
+            text = rec.get("text", "")
+            pmid = rec.get("pmid")
 
+            full_text = f"{title}\n{text}".strip()
+
+            # نحتفظ بالمقالة إذا احتوت على مصطلحات السكتة أو الدورة الخلفية
+            if not (STROKE_RE.search(full_text) or POSTERIOR_RE.search(full_text)):
+                continue
+            if len(text.strip()) < 80:
+                continue
+
+            kept += 1
+            chunks = chunk_text(full_text)
+
+            for i, ch in enumerate(chunks, start=1):
+                chunk_id = f"pmid_{pmid}_chunk_{i}"
+                out = {
+                    "id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "pmid": pmid,
+                    "title": title,
+                    "text": ch,
+                    "source": "PubMedSubset"
+                }
+                (CHUNKS_DIR / f"{chunk_id}.json").write_text(
+                    json.dumps(out, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+                chunk_count += 1
+
+    print("\n==============================")
+    print(f"Total scanned: {total:,}")
+    print(f"Stroke records kept: {kept:,}")
+    print(f"Total chunks written: {chunk_count:,}")
+    print("Chunks directory:", CHUNKS_DIR)
+    print("==============================")
 
 if __name__ == "__main__":
     main()
