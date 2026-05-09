@@ -5,6 +5,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ========== Hugging Face API ==========
+try:
+    from huggingface_hub import InferenceClient
+    _HF_AVAILABLE = True
+except ImportError:
+    _HF_AVAILABLE = False
+
+# =======================================
+
 # ========== قراءة إعدادات التوليد من config.yaml ==========
 try:
     with open("config.yaml", "r", encoding="utf-8") as f:
@@ -14,28 +23,33 @@ except Exception:
 
 _GEN = (_CFG.get("generation") or {})
 _MAX_NEW = int(_GEN.get("max_new_tokens", 256))
-_TEMP = float(_GEN.get("temperature", 0.2))
-_TOP_P = float(_GEN.get("top_p", 0.9))
-_TOP_K = int(_GEN.get("top_k", 50))
-_REP  = float(_GEN.get("repetition_penalty", 1.05))
+_TEMP = float(_GEN.get("temperature", 0.0))
+_TOP_P = float(_GEN.get("top_p", 1.0))
+_TOP_K = int(_GEN.get("top_k", 0))
+_REP = float(_GEN.get("repetition_penalty", 1.05))
 
-# ========== OpenAI (اختياري) ==========
+# ✅ Stops من config (مهم لـ Qwen GGUF)
+_STOP = _GEN.get("stop")
+if not isinstance(_STOP, list) or not _STOP:
+    _STOP = ["<|im_end|>", "</s>", "<|endoftext|>"]
+
+PROVIDER = os.getenv(
+    "LLM_PROVIDER",
+    os.getenv("llm_provider", (_CFG.get("models") or {}).get("llm_provider", "local")),
+).lower()
+
+# ========== OpenAI-compatible client (OpenAI / Groq) ==========
 try:
     from openai import OpenAI  # type: ignore
 except Exception:
     OpenAI = None
-
-PROVIDER = os.getenv(
-    "LLM_PROVIDER",
-    os.getenv("llm_provider", (_CFG.get("models") or {}).get("llm_provider", "local"))
-).lower()
 
 _oai = None
 
 
 def get_openai():
     if OpenAI is None:
-        raise RuntimeError("حزمة openai غير مثبتة. ثبّت openai>=1.40 أو اضبط provider=local.")
+        raise RuntimeError("حزمة openai غير مثبتة. ثبّت openai>=1.40")
     global _oai
     if _oai is None:
         _oai = OpenAI()
@@ -46,19 +60,177 @@ def oai_chat(system_prompt: str, user_prompt: str, model_name: str | None = None
     client = get_openai()
     model = model_name or os.getenv(
         "OPENAI_MODEL",
-        (_CFG.get("models") or {}).get("openai_model", "gpt-4o-mini")
+        (_CFG.get("models") or {}).get("openai_model", "gpt-4o-mini"),
     )
     resp = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": (system_prompt or "").strip()},
+            {"role": "user", "content": (user_prompt or "").strip()},
         ],
         temperature=_TEMP,
+        top_p=_TOP_P if _TEMP > 0 else None,
+        max_tokens=_MAX_NEW,
     )
     return resp.choices[0].message.content
 
 
+def groq_chat(system_prompt: str, user_prompt: str, model_name: str | None = None) -> str:
+    """
+    Groq يدعم OpenAI-compatible endpoint.
+    لازم يكون GROQ_API_KEY موجود كـ env var.
+    """
+    if OpenAI is None:
+        raise RuntimeError("حزمة openai غير مثبتة. ثبّت openai>=1.40")
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY غير موجود. ضيفه للـ env.")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+    )
+
+    model = model_name or (_CFG.get("models") or {}).get("llm_model", "llama-3.1-8b-instant")
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": (system_prompt or "").strip()},
+            {"role": "user", "content": (user_prompt or "").strip()},
+        ],
+        temperature=_TEMP,
+        top_p=_TOP_P if _TEMP > 0 else None,
+        max_tokens=_MAX_NEW,
+    )
+    return resp.choices[0].message.content
+
+
+# ========== llama.cpp (GGUF) ==========
+try:
+    from llama_cpp import Llama  # type: ignore
+except Exception:
+    Llama = None
+
+_llama_cache: dict[str, "Llama"] = {}
+
+
+def _get_llama_cpp(model_path: str):
+    if Llama is None:
+        raise RuntimeError("llama-cpp-python غير مثبت أو فشل الاستيراد. ثبّت llama-cpp-python.")
+
+    model_path = (model_path or "").strip()
+    if not model_path:
+        raise RuntimeError("GGUF model path فارغ.")
+
+    if model_path in _llama_cache:
+        return _llama_cache[model_path]
+
+    n_ctx = int(os.getenv("LLAMA_N_CTX", "2048"))
+    n_gpu_layers = int(os.getenv("LLAMA_N_GPU_LAYERS", "20"))
+    n_threads = int(os.getenv("LLAMA_N_THREADS", "8"))
+
+    llm = Llama(
+        model_path=model_path,
+        n_ctx=n_ctx,
+        n_gpu_layers=n_gpu_layers,
+        n_threads=n_threads,
+        verbose=False,
+    )
+    _llama_cache[model_path] = llm
+    return llm
+
+
+def llama_cpp_chat(system_prompt: str, user_prompt: str, model_name: str) -> str:
+    llm = _get_llama_cpp(model_name)
+    resp = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": (system_prompt or "").strip()},
+            {"role": "user", "content": (user_prompt or "").strip()},
+        ],
+        max_tokens=_MAX_NEW,
+        temperature=_TEMP,
+        top_p=_TOP_P,
+        top_k=_TOP_K,
+        repeat_penalty=_REP,
+        stop=_STOP,
+    )
+    choice0 = (resp.get("choices") or [{}])[0]
+    msg = choice0.get("message") or {}
+    content = msg.get("content")
+    if content is None:
+        content = choice0.get("text", "")
+    return (content or "").strip()
+
+
+# ========== Hugging Face API (محسّن مع debug) ==========
+def generate_answer_hf_api(system_prompt: str, user_prompt: str, model_name: str | None = None) -> str:
+    """
+    توليد إجابة باستخدام Hugging Face Inference API.
+    يستخدم نقطة النهاية /v1/chat/completions إذا كانت متاحة، وإلا يستخدم /v1/completions.
+    """
+    import json  # للطباعة
+    if not _HF_AVAILABLE:
+        raise RuntimeError("مكتبة huggingface_hub غير مثبتة. ثبّتها باستخدام: pip install huggingface-hub")
+
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN غير موجود. ضيفه للـ env أو ملف .env")
+
+    model = model_name or (_CFG.get("models") or {}).get("hf_model", "Intelligent-Internet/II-Medical-8B-1706")
+
+    client = InferenceClient(model=model, token=token)
+
+    # تجهيز الرسائل
+    messages = [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt.strip()}
+    ]
+
+    # محاولة استخدام واجهة الدردشة (chat) أولاً
+        # محاولة استخدام واجهة الدردشة (chat) أولاً
+    try:
+        response = client.chat_completion(
+            messages=messages,
+            max_tokens=_MAX_NEW,
+            temperature=_TEMP,
+            top_p=_TOP_P,
+            stop=_STOP,
+        )
+        if response and response.choices:
+            msg = response.choices[0].message
+            content = msg.content
+            reasoning = getattr(msg, 'reasoning', None)  # بعض النماذج تضع الإجابة في reasoning
+            
+            if content and content.strip():
+                return content.strip()
+            elif reasoning and reasoning.strip():
+                return reasoning.strip()
+            else:
+                return "No response content from model."
+        else:
+            return "No response from model."
+    except Exception as e:
+        # إذا فشلت chat_completion، نستخدم text_generation
+        try:
+            # بناء prompt بسيط
+            prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
+            response = client.text_generation(
+                prompt,
+                max_new_tokens=_MAX_NEW,
+                temperature=_TEMP,
+                top_p=_TOP_P,
+                stop_sequences=_STOP,
+                do_sample=(_TEMP > 0),
+            )
+            if isinstance(response, str):
+                return response.strip()
+            else:
+                return str(response).strip()
+        except Exception as e2:
+            raise RuntimeError(f"فشل الاتصال عبر text_generation: {e2}")
+        
 # ========== Local (transformers) ==========
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -77,9 +249,6 @@ def _pick_device() -> str:
 
 
 def _copy_gen_config(gen_cfg):
-    """
-    نسخ GenerationConfig بشكل متوافق مع transformers القديمة والجديدة.
-    """
     try:
         cls = gen_cfg.__class__
         return cls.from_dict(gen_cfg.to_dict())
@@ -87,27 +256,66 @@ def _copy_gen_config(gen_cfg):
         return copy.deepcopy(gen_cfg)
 
 
+from pathlib import Path
+import re
+
+
+def _to_local_path_if_any(model_name: str) -> Path | None:
+    s = (model_name or "").strip()
+
+    if re.match(r"^[A-Za-z]:[\\/]", s):
+        p = Path(s)
+        return p if p.exists() else None
+
+    if s.startswith(("/", "\\")):
+        p = Path(s)
+        return p if p.exists() else None
+
+    p = Path(s)
+    if p.exists():
+        return p
+
+    return None
+
+
 def get_local(model_name: str):
-    """
-    تحميل tokenizer + model على الجهاز المناسب (cuda/ cpu) مع كاش داخلي.
-    """
     if (AutoModelForCausalLM is None) or (AutoTokenizer is None):
-        raise RuntimeError("transformers غير متاح. ثبّت transformers + torch لتشغيل المزوّد المحلي.")
+        raise RuntimeError("transformers غير متاح. ثبّت transformers + torch.")
 
     if model_name in _local_cache:
         return _local_cache[model_name]
 
     device = _pick_device()
-    tok = AutoTokenizer.from_pretrained(model_name)
+
+    local_path = _to_local_path_if_any(model_name)
+    if local_path is not None:
+        src = local_path
+        local_only = True
+    else:
+        src = model_name
+        local_only = False
+
+    tok = AutoTokenizer.from_pretrained(
+        src,
+        local_files_only=local_only,
+        trust_remote_code=True,
+    )
 
     try:
         mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=(torch.float16 if (device == "cuda") else None),  # ✅ بدل torch_dtype
+            src,
+            local_files_only=local_only,
+            trust_remote_code=True,
+            dtype=(torch.float16 if (torch is not None and device == "cuda") else None),
         ).to(device)
     except Exception:
         device = "cpu"
-        mdl = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        mdl = AutoModelForCausalLM.from_pretrained(
+            src,
+            local_files_only=local_only,
+            trust_remote_code=True,
+            dtype=None,
+        ).to("cpu")
 
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
@@ -127,18 +335,11 @@ def _reload_on_cpu(model_name: str):
 
 
 def local_generate(system_prompt: str, user_prompt: str, model_name: str) -> str:
-    """
-    - chat_template إذا متاح
-    - يرجّع فقط التوكنات الجديدة
-    - يستخدم GenerationConfig (لتقليل تحذيرات generation flags)
-    - fallback CPU عند OOM
-    """
     if torch is None or GenerationConfig is None:
-        raise RuntimeError("torch/transformers غير متاحين لتشغيل المزوّد المحلي.")
+        raise RuntimeError("torch/transformers غير متاحين لتشغيل local provider.")
 
     tok, mdl, device = get_local(model_name)
 
-    # Build prompt using chat template if available
     if hasattr(tok, "apply_chat_template"):
         messages = []
         if system_prompt and system_prompt.strip():
@@ -168,12 +369,10 @@ def local_generate(system_prompt: str, user_prompt: str, model_name: str) -> str
         gen_cfg.top_p = _TOP_P
         gen_cfg.top_k = _TOP_K
     else:
-        # greedy: ما نحتاج sampling params
         gen_cfg.temperature = None
         gen_cfg.top_p = None
         gen_cfg.top_k = None
 
-    # ---- generate with OOM fallback ----
     try:
         with torch.inference_mode():
             out = mdl.generate(**ids, generation_config=gen_cfg)
@@ -215,18 +414,22 @@ def local_generate(system_prompt: str, user_prompt: str, model_name: str) -> str
 def generate_answer(system_prompt: str, user_prompt: str, provider: str | None = None, model_name: str | None = None) -> str:
     provider = (provider or PROVIDER).lower()
 
-    if provider == "openai":
-        try:
-            return oai_chat(system_prompt, user_prompt, model_name=model_name)
-        except Exception:
-            local_name = model_name or (_CFG.get("models") or {}).get(
-                "llm_model",
-                "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-            )
-            return local_generate(system_prompt, user_prompt, model_name=local_name)
+    if provider == "groq":
+        return groq_chat(system_prompt, user_prompt, model_name=model_name)
 
+    if provider == "openai":
+        return oai_chat(system_prompt, user_prompt, model_name=model_name)
+
+    if provider == "hf_api":
+        return generate_answer_hf_api(system_prompt, user_prompt, model_name=model_name)
+
+    if provider == "llama_cpp":
+        gguf_path = model_name or (_CFG.get("models") or {}).get("llm_model", "")
+        return llama_cpp_chat(system_prompt, user_prompt, model_name=gguf_path)
+
+    # default: transformers local
     local_name = model_name or (_CFG.get("models") or {}).get(
         "llm_model",
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     )
     return local_generate(system_prompt, user_prompt, model_name=local_name)
