@@ -25,7 +25,7 @@ FAISS_PATH = INDEX_DIR / "faiss_hnsw.index"
 METAS_PATH = INDEX_DIR / "metas.json"
 BM25_PATH  = INDEX_DIR / "bm25.joblib"
 
-# ---------- Tokenizer ----------
+# ---------- Tokenizer ---------- preprocssing 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+|[\u0600-\u06FF]+", re.UNICODE)
 
 def tokenize(text: str):

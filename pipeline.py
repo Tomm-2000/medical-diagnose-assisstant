@@ -11,19 +11,24 @@ from app.rag.utils_text import safe_truncate
 from app.models.medcpt_reranker import rerank_docs
 from app.models.llm import generate_answer
 from app.rag.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+from app.rag.clinical_signals import detect_clinical_signals, summarize_signals
+from app.rag.common_utils import _contains_arabic, _safe_float
+
+try:
+    from app.rag.clinical_subtype_resolver import resolve_clinical_subtype
+    _HAS_SUBTYPE_RESOLVER = True
+except Exception:
+    resolve_clinical_subtype = None
+    _HAS_SUBTYPE_RESOLVER = False
 
 _AR_RE = re.compile(r"[\u0600-\u06FF]")
-
-
-def _contains_arabic(text: str) -> bool:
-    return bool(_AR_RE.search(text or ""))
 
 
 def _translate_if_arabic(text: str) -> str:
     return text
 
 
-PIPELINE_VERSION = "v7.7-kg-pipeline-final"
+PIPELINE_VERSION = "v7.12.11-sourcecheckup-output-contract"
 
 
 try:
@@ -349,15 +354,6 @@ _UNCERTAINTY_TERMS = [
 ]
 
 
-def _safe_float(x, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
 def _compute_source_grounding_strength(source: Dict) -> float:
     text = (source.get("text") or source.get("snippet") or "").lower()
     hybrid = _safe_float(source.get("hybrid_score"), 0.0)
@@ -620,24 +616,943 @@ def _dedup_docs(items: List[Dict]) -> List[Dict]:
         out.append(item)
 
     return out
+def _extract_case_age(case_text: str) -> Optional[int]:
+    t = (case_text or "").lower()
+
+    patterns = [
+        r"\b(\d{1,3})\s*[- ]?year[- ]old\b",
+        r"\b(\d{1,3})\s*years?\s*old\b",
+        r"\b(\d{1,3})\s*y/o\b",
+        r"\b(\d{1,3})\s*yo\b",
+    ]
+
+    for p in patterns:
+        m = re.search(p, t)
+        if not m:
+            continue
+
+        try:
+            age = int(m.group(1))
+            if 0 <= age <= 120:
+                return age
+        except Exception:
+            pass
+
+    return None
+
+
+def _source_age_mismatch_penalty(source: Dict, case_text: str) -> float:
+    """
+    Penalize pediatric/child/fever/infection articles when the case is clearly adult
+    and does not mention fever/infection.
+    """
+    title = (source.get("title") or "").lower()
+    text = (source.get("text") or source.get("snippet") or "").lower()
+    combined = f"{title} {text}"
+
+    case_low = (case_text or "").lower()
+    age = _extract_case_age(case_text)
+
+    adult_case = bool(
+        (age is not None and age >= 18)
+        or any(t in case_low for t in [
+            "adult", "man", "woman", "male", "female",
+            "elderly", "older", "old man", "old woman"
+        ])
+    )
+
+    pediatric_article = bool(
+        any(t in combined for t in [
+            "child",
+            "children",
+            "pediatric",
+            "paediatric",
+            "infant",
+            "newborn",
+            "neonate",
+            "adolescent",
+            "boy",
+            "girl",
+        ])
+        or re.search(r"\b([0-9]|1[0-7])\s*[- ]?year[- ]old\b", combined)
+        or re.search(r"\b([0-9]|1[0-7])\s*years?\s*old\b", combined)
+    )
+
+    penalty = 0.0
+
+    if adult_case and pediatric_article:
+        penalty += 6.0
+
+    article_has_fever_or_infection = any(t in combined for t in [
+        "fever",
+        "febrile",
+        "infection",
+        "infectious",
+        "meningitis",
+        "encephalitis",
+        "cryptococcosis",
+        "sepsis",
+    ])
+
+    case_has_fever_or_infection = any(t in case_low for t in [
+        "fever",
+        "febrile",
+        "infection",
+        "infectious",
+        "meningitis",
+        "encephalitis",
+        "cryptococcosis",
+        "sepsis",
+    ])
+
+    if article_has_fever_or_infection and not case_has_fever_or_infection:
+        penalty += 2.0
+
+    return penalty
+
+
+def _final_source_priority_for_case(source: Dict, case_text: str) -> float:
+    return _final_source_priority(source) - _source_age_mismatch_penalty(source, case_text)
+
+
+# =========================
+# SourceCheckup output contract
+# =========================
+
+
+def _attach_sourcecheckup_explanation(
+    out: Dict,
+    *,
+    case_text: str,
+    clinical_signals: Optional[Dict] = None,
+    sources: Optional[List[Dict]] = None,
+    grounding: Optional[Dict] = None,
+    legacy_fallback: bool = False,
+    agent_error: Optional[str] = None,
+) -> Dict:
+    """Ensure every pipeline response exposes the same explainability contract.
+
+    The agentic controller already returns a full claim-level explanation. This
+    helper is mainly for legacy/error fallback paths so API/UI callers never
+    receive a response that silently omits ``explanation``.
+
+    Legacy fallback explanations are explicitly marked as limited because they
+    were not selected by Evidence Judge and therefore must not be presented as
+    equivalent to the agentic SourceCheckup path.
+    """
+    if not isinstance(out, dict):
+        out = {"answer": "Evidence is insufficient"}
+    if isinstance(out.get("explanation"), dict):
+        out.setdefault("explainability_included", True)
+        return out
+
+    final_answer = str(out.get("answer") or "Evidence is insufficient")
+    source_rows = [d for d in (sources or out.get("sources") or []) if isinstance(d, dict)]
+    grounding_map = dict(grounding or out.get("grounding") or {})
+    signals = clinical_signals if isinstance(clinical_signals, dict) else out.get("clinical_signals")
+
+    try:
+        from app.rag.explainability import build_explanation
+
+        explanation = build_explanation(
+            case_text=case_text,
+            final_answer=final_answer,
+            selected_candidate=None,
+            candidates=(),
+            clinical_signals=signals or {},
+            clinical_intent={},
+            retrieved_sources=source_rows,
+            kg_sources=[
+                d for d in source_rows
+                if d.get("from_kg") or d.get("graph_score") is not None
+            ],
+            grounding=grounding_map,
+            evidence_judge_reason=(
+                "legacy_fallback_without_evidence_judge"
+                if legacy_fallback
+                else "agentic_result_missing_explanation"
+            ),
+            candidate_kg_verifications={},
+            safety_flags={
+                "legacy_fallback": bool(legacy_fallback),
+                "agent_error": agent_error,
+                "limited_explainability": bool(legacy_fallback),
+            },
+            debug_info={
+                "decision_origin": "legacy_fallback" if legacy_fallback else "pipeline_wrapper",
+                "agent_error": agent_error,
+            },
+        )
+        explanation["decision_origin"] = "legacy_fallback" if legacy_fallback else "pipeline_wrapper"
+        explanation["limited_explainability"] = bool(legacy_fallback)
+        if legacy_fallback:
+            explanation["limitations"] = [
+                "This response was produced by the legacy fallback path.",
+                "No Evidence Judge candidate-level decision is available for this response.",
+                "Claim statuses describe available support but are not equivalent to the agentic path.",
+            ]
+        out["explanation"] = explanation
+        out["explainability_included"] = True
+    except Exception as exc:
+        out["explainability_included"] = False
+        out["explanation"] = {
+            "explainability_version": "v7.14-sourcecheckup-fallback",
+            "final_answer": final_answer,
+            "selected_candidate": None,
+            "claims": [],
+            "metrics": {
+                "total_claims": 0,
+                "supported_claims": 0,
+                "partially_supported_claims": 0,
+                "unsupported_claims": 0,
+                "contradicted_claims": 0,
+                "not_verifiable_claims": 0,
+                "claim_support_rate": 0.0,
+                "citation_coverage": 0.0,
+                "contradiction_rate": 0.0,
+                "fully_supported_response": False,
+            },
+            "decision_origin": "legacy_fallback" if legacy_fallback else "pipeline_wrapper",
+            "limited_explainability": True,
+            "error": f"explainability_failed: {type(exc).__name__}: {exc}",
+        }
+
+    out.setdefault("agentic_mode", not legacy_fallback)
+    if agent_error:
+        out["agent_error"] = agent_error
+    return out
 
 
 # =========================
 # Main function
 # =========================
 
+
+def _normalize_llm_answer_from_evidence(
+    answer: str,
+    *,
+    case_text_en: str,
+    grounding: dict | None,
+    best_doc: dict | None,
+    sources: list | None,
+) -> str:
+    """
+    Conservative final guardrail after LLM generation.
+    ??? rule engine ????.
+    ???? ??? ????? ???? grounding ??? ?????? ??? LLM.
+    """
+    ans = (answer or "").strip()
+    q = (case_text_en or "").lower()
+    grounding = grounding or {}
+    sources = sources or []
+
+    allow_llm = bool(grounding.get("allow_llm", False))
+    top_strength = float(grounding.get("top_strength", 0.0) or 0.0)
+
+    # ?? ???? ??????? ??????? ?? ???? ??????
+    if not allow_llm or top_strength < 0.72:
+        return ans or "Evidence is insufficient"
+
+    def has_any(text: str, terms: list[str]) -> bool:
+        return any(t in text for t in terms)
+
+    evidence_parts = []
+    docs = []
+    if best_doc:
+        docs.append(best_doc)
+    docs.extend(list(sources or [])[:8])
+
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        for k in (
+            "title",
+            "text",
+            "graph_disease",
+            "graph_category",
+            "graph_article_type",
+            "source",
+        ):
+            v = d.get(k)
+            if v:
+                evidence_parts.append(str(v))
+
+    ev = " ".join(evidence_parts).lower()
+
+    focal_terms = [
+        "weakness",
+        "arm weakness",
+        "leg weakness",
+        "aphasia",
+        "slurred speech",
+        "speech disturbance",
+        "facial droop",
+        "hemiparesis",
+        "numbness",
+        "vision loss",
+    ]
+
+    has_focal_deficit = has_any(q, focal_terms)
+
+    resolved_markers = [
+        "completely resolved",
+        "fully resolved",
+        "resolved after",
+        "resolved within",
+        "resolved in",
+        "transient",
+    ]
+
+    minutes_pattern = re.search(
+        r"\b([1-9]\d?|1[01]\d|120)\s*(?:min|mins|minute|minutes)\b",
+        q,
+    )
+
+    suggests_tia = (
+        has_focal_deficit
+        and has_any(q, resolved_markers)
+        and minutes_pattern is not None
+        and not has_any(q, ["ongoing", "persistent", "still has", "continues"])
+    )
+
+    if suggests_tia:
+        return "Transient ischemic attack."
+
+    posterior_case = (
+        has_any(q, ["vertigo", "diplopia", "double vision", "ataxia", "gait", "nystagmus", "dizziness"])
+        and has_any(
+            ev,
+            [
+                "posterior circulation",
+                "brainstem",
+                "vertebrobasilar",
+                "lateral medullary",
+                "midbrain infarction",
+                "cerebellar stroke",
+                "cerebellar infarction",
+            ],
+        )
+    )
+
+    hemorrhage_case = (
+        has_any(q, ["thunderclap", "vomiting", "decreased consciousness", "loss of consciousness"])
+        and has_any(ev, ["subarachnoid hemorrhage", "intracranial hemorrhage", "brain haemorrhage", "brain hemorrhage"])
+    )
+
+    acute_ischemic_case = (
+        has_focal_deficit
+        and has_any(q, ["sudden", "minutes ago", "45 minutes", "hour", "hours"])
+        and has_any(ev, ["acute ischemic stroke", "acute ischaemic stroke", "ischemic stroke", "ischaemic stroke", "cortical stroke", "mca stroke"])
+    )
+
+    ans_low = ans.lower()
+
+    # ??? ??? LLM ???? ???? ???? ????? ????? ??? ???? subtype ??? ???? ?????? ???????
+    if ans and ans_low != "evidence is insufficient":
+        if posterior_case and has_any(
+            ans_low,
+            [
+                "midbrain infarction",
+                "lateral medullary infarction",
+                "cerebellar infarction",
+                "brainstem infarction",
+            ],
+        ):
+            if "lateral medullary" in ans_low:
+                return "Acute lateral medullary infarction / posterior circulation ischemic stroke."
+            return "Acute posterior circulation / brainstem ischemic stroke."
+        return ans
+
+    # ??? ??? LLM ??? insufficient ??? ???? grounding ???? ?????? evidence-backed diagnosis
+    if posterior_case:
+        if "lateral medullary" in ev:
+            return "Acute lateral medullary infarction / posterior circulation ischemic stroke."
+        return "Acute posterior circulation / brainstem ischemic stroke."
+
+    if hemorrhage_case:
+        return "Acute intracranial hemorrhage / subarachnoid hemorrhage."
+
+    if acute_ischemic_case:
+        return "Acute ischemic stroke."
+
+    return ans or "Evidence is insufficient"
+
+
+
+
+# =========================================================
+# Clinical Safety Guard Helpers
+# =========================================================
+
+def _clinical_case_flags(case_text: str) -> dict:
+    """
+    Detect high-level clinical patterns that should constrain the final answer.
+    This is not a rule engine for diagnosis; it is a safety/compatibility layer
+    that prevents unsupported diagnoses copied from retrieved article titles.
+    """
+    q = (case_text or "").lower()
+
+    neuro_terms = [
+        "weakness", "aphasia", "slurred speech", "dysarthria",
+        "facial droop", "facial weakness", "ataxia", "vertigo",
+        "diplopia", "numbness", "hemiparesis", "visual loss"
+    ]
+
+    return {
+        "seizure_mimic": any(t in q for t in [
+            "generalized seizure", "seizure", "convulsion", "postictal"
+        ]),
+
+        "hypoglycemia_mimic": (
+            "glucose" in q
+            or "hypoglycemia" in q
+            or "hypoglycaemia" in q
+            or ("diabetic" in q and "improved" in q and "glucose" in q)
+        ),
+
+        "peripheral_facial_palsy": (
+            ("facial weakness" in q or "facial droop" in q)
+            and ("forehead" in q or "including the forehead" in q)
+            and (
+                "isolated" in q
+                or "no arm weakness" in q
+                or "without arm weakness" in q
+                or "no limb weakness" in q
+                or "without limb weakness" in q
+            )
+            and (
+                "no arm weakness or speech difficulty" in q
+                or "no speech difficulty" in q
+                or "without speech difficulty" in q
+                or "without aphasia" in q
+                or "no aphasia" in q
+            )
+        ),
+
+        "trauma_anticoag_bleed": (
+            any(t in q for t in ["fall", "trauma", "head injury"])
+            and any(t in q for t in [
+                "warfarin", "anticoagulant", "rivaroxaban",
+                "dabigatran", "apixaban"
+            ])
+            and any(t in q for t in [
+                "headache", "confusion", "progressive weakness",
+                "decreased consciousness"
+            ])
+        ),
+
+        "cardiac_out_of_domain": (
+            any(t in q for t in [
+                "chest pain", "st elevation", "stemi",
+                "myocardial infarction", "coronary"
+            ])
+            and not any(t in q for t in neuro_terms)
+        ),
+
+        "aortic_dissection_supported": any(t in q for t in [
+            "aortic dissection", "tearing chest pain", "tearing back pain",
+            "back pain", "pulse deficit", "hypotension", "syncope"
+        ]),
+    }
+
+
+# [تم حذف كود ميت مكرر غير مستخدم: _clinical_safety_normalize_answer (v1, superseded by v2) — السطر الأصلي 1071-1118]
+def _has_any_text(q: str, terms: list[str]) -> bool:
+    q = (q or "").lower()
+    return any(t in q for t in terms)
+
+
+def _case_age_years_v2(case_text: str):
+    import re
+    q = (case_text or "").lower()
+    m = re.search(r"\b(\d{1,3})[- ]year[- ]old\b|\b(\d{1,3})\s*years?\s*old\b", q)
+    if not m:
+        return None
+    for g in m.groups():
+        if g:
+            try:
+                return int(g)
+            except Exception:
+                return None
+    return None
+
+
+def _clinical_flags_v2(case_text: str) -> dict:
+    q = (case_text or "").lower()
+    age = _case_age_years_v2(q)
+
+    # New clinical signal layer: the old keyword checks remain below as a
+    # deterministic safety fallback, while this layer centralizes richer
+    # acute/posterior/hemorrhage/motor/language/chronic signals.
+    try:
+        cs = detect_clinical_signals(q, use_model=False)
+    except Exception:
+        cs = {}
+
+    neuro_focal = (
+        _has_any_text(q, [
+            "weakness", "hemiplegia", "hemiparesis", "aphasia",
+            "slurred speech", "dysarthria", "facial droop",
+            "facial weakness", "neglect", "gaze deviation",
+            "hemianopia", "visual field loss", "ataxia", "diplopia"
+        ])
+        or bool(cs.get("has_motor"))
+        or bool(cs.get("has_language"))
+        or bool(cs.get("is_posterior"))
+    )
+
+    posterior_terms = (
+        _has_any_text(q, [
+            "vertigo", "diplopia", "ataxia", "unsteady gait",
+            "inability to walk", "inability to stand", "truncal ataxia",
+            "dysphagia", "hoarseness", "brainstem", "cerebellar"
+        ])
+        or bool(cs.get("is_posterior"))
+    )
+
+    hemorrhage_terms = (
+        _has_any_text(q, [
+            "thunderclap", "worst headache", "neck stiffness",
+            "photophobia", "decreased consciousness", "reduced alertness"
+        ])
+        or ("headache" in q and _has_any_text(q, ["vomiting", "confusion", "very high blood pressure"]))
+        or bool(cs.get("is_hemorrhage"))
+    )
+
+    transient_terms = _has_any_text(q, [
+        "resolved", "completely resolved", "complete recovery",
+        "recovered fully", "now completely normal", "brief",
+        "transient", "lasting 10 minutes", "lasting 15 minutes",
+        "lasting 20 minutes", "resolved after", "resolving within"
+    ])
+
+    retinal_tia = (
+        _has_any_text(q, ["painless vision loss", "curtain-like", "one eye", "monocular"])
+        and transient_terms
+    )
+
+    return {
+        "age": age,
+        "neuro_focal": neuro_focal,
+        "posterior_terms": posterior_terms,
+        "hemorrhage_terms": hemorrhage_terms,
+        "transient_terms": transient_terms,
+        "retinal_tia": retinal_tia,
+        "clinical_signal_summary": summarize_signals(cs) if cs else "fallback-only",
+        "clinical_signal_scores": cs.get("scores", {}) if cs else {},
+
+        "migraine_aura": (
+            _has_any_text(q, ["zigzag", "visual aura", "visual lines"])
+            and "gradual" in q
+            and "headache" in q
+        ),
+
+        "seizure_mimic": _has_any_text(q, [
+            "generalized seizure", "seizure", "convulsion", "postictal"
+        ]),
+
+        "hypoglycemia_mimic": (
+            "glucose" in q
+            or "hypoglycemia" in q
+            or "hypoglycaemia" in q
+            or ("diabetic" in q and "improved" in q)
+        ),
+
+        "peripheral_facial_palsy": (
+            ("facial weakness" in q or "facial droop" in q)
+            and ("forehead" in q or "including the forehead" in q)
+            and (
+                "isolated" in q
+                or "no arm weakness" in q
+                or "without arm weakness" in q
+                or "no limb weakness" in q
+                or "without limb weakness" in q
+            )
+            and (
+                "no arm weakness or speech difficulty" in q
+                or "no speech difficulty" in q
+                or "without speech difficulty" in q
+                or "without aphasia" in q
+                or "no aphasia" in q
+            )
+        ),
+
+        "syncope_mimic": (
+            _has_any_text(q, ["fainted", "syncope", "briefly fainted"])
+            and _has_any_text(q, ["recovered fully", "without weakness", "without speech"])
+        ),
+
+        "peripheral_vertigo_mimic": (
+            "positional vertigo" in q
+            and _has_any_text(q, ["turning in bed", "lasting seconds", "triggered by turning"])
+            and _has_any_text(q, ["without weakness", "without diplopia", "without ataxia"])
+        ),
+
+        "functional_mimic": (
+            _has_any_text(q, ["inconsistent", "changes during examination", "emotional stress"])
+        ),
+
+        "pediatric_infection_mismatch": (
+            age is not None and age < 18
+            and _has_any_text(q, ["fever", "headache", "ataxia"])
+        ),
+
+        "trauma_bleed": (
+            not _has_any_text(q, ["without trauma", "no trauma", "without head trauma", "no head trauma"])
+            and _has_any_text(q, ["fall", "trauma", "head injury", "minor head trauma"])
+            and _has_any_text(q, ["headache", "confusion", "progressive weakness", "decreased consciousness"])
+        ),
+
+        "trauma_anticoag_bleed": (
+            not _has_any_text(q, ["without trauma", "no trauma", "without head trauma", "no head trauma"])
+            and _has_any_text(q, ["fall", "trauma", "head injury"])
+            and _has_any_text(q, ["warfarin", "anticoagulant", "rivaroxaban", "dabigatran", "apixaban"])
+        ),
+
+        "anticoag_without_bleed_features": (
+            _has_any_text(q, ["warfarin", "apixaban", "rivaroxaban", "dabigatran"])
+            and _has_any_text(q, ["without trauma", "no trauma", "without headache", "no headache"])
+        ),
+
+        "cardiac_out_of_domain": (
+            _has_any_text(q, ["chest pain", "st elevation", "stemi", "myocardial infarction", "coronary"])
+            and not neuro_focal
+        ),
+
+        "aortic_dissection_supported": _has_any_text(q, [
+            "aortic dissection", "tearing chest pain", "tearing back pain",
+            "pulse deficit", "hypotension"
+        ]),
+    }
+
+
+def _clinical_safety_normalize_answer(case_text: str, answer: str, grounding: dict, sources: list) -> str:
+    """
+    Clinical compatibility override v2.
+    It prevents unsupported diagnoses copied from retrieved article titles,
+    and handles common stroke mimics and transient presentations.
+    """
+    q = (case_text or "").lower()
+    ans = (answer or "").strip()
+    ans_l = ans.lower()
+    f = _clinical_flags_v2(q)
+
+    # Strong mimic / out-of-domain guards
+    if (
+        f["cardiac_out_of_domain"]
+        or f["migraine_aura"]
+        or f["seizure_mimic"]
+        or f["hypoglycemia_mimic"]
+        or f["peripheral_facial_palsy"]
+        or f["syncope_mimic"]
+        or f["peripheral_vertigo_mimic"]
+        or f["functional_mimic"]
+        or f["pediatric_infection_mismatch"]
+    ):
+        return "Evidence is insufficient"
+
+    # Trauma-related progressive neurological symptoms
+    if f["trauma_bleed"] or f["trauma_anticoag_bleed"]:
+        return "Acute intracranial hemorrhage / traumatic subdural hemorrhage"
+
+    # Warfarin/apixaban alone should not force traumatic hemorrhage
+    if f["anticoag_without_bleed_features"] and f["neuro_focal"]:
+        return "Acute ischemic stroke"
+
+    # Transient focal symptoms should be TIA, not acute infarction
+    if f["retinal_tia"]:
+        return "Transient ischemic attack"
+
+    if f["transient_terms"] and f["neuro_focal"] and not f["hemorrhage_terms"]:
+        return "Transient ischemic attack"
+
+    # Hemorrhage pattern
+    if f["hemorrhage_terms"]:
+        if "subarachnoid" in ans_l:
+            return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+        if "hemorrhage" in ans_l or "haemorrhage" in ans_l:
+            return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+
+    # Posterior/cerebellar symptoms should not become hemorrhage unless hemorrhage signs exist
+    if f["posterior_terms"] and not f["hemorrhage_terms"]:
+        if "hemorrhage" in ans_l or "subarachnoid" in ans_l:
+            return "Acute posterior circulation / brainstem ischemic stroke"
+        if "sudden deafness" in ans_l and "deafness" not in q and "hearing loss" not in q:
+            return "Acute posterior circulation / brainstem ischemic stroke"
+
+    # Remove unsupported hemorrhage attached to ischemic stroke
+    if ("ischemic stroke" in ans_l or "ischaemic stroke" in ans_l) and (
+        "subarachnoid" in ans_l or "hemorrhage" in ans_l or "haemorrhage" in ans_l
+    ) and not f["hemorrhage_terms"]:
+        return "Acute ischemic stroke"
+
+    # Occipital / visual field focal deficit
+    if _has_any_text(q, ["homonymous hemianopia", "visual field loss"]) and not f["hemorrhage_terms"]:
+        return "Posterior circulation ischemic stroke"
+
+    # Remove unsupported aortic dissection noise
+    if "aortic dissection" in ans_l and not f["aortic_dissection_supported"]:
+        if "ischemic stroke" in ans_l or "ischaemic stroke" in ans_l:
+            return "Acute ischemic stroke"
+        return "Evidence is insufficient"
+
+    return ans
+
+
+
+
+
+# =========================================================
+# Final Taxonomy Normalizer v1
+# =========================================================
+
+def _final_taxonomy_normalize_answer(case_text: str, answer: str, grounding: dict, sources: list) -> str:
+    """
+    Final answer taxonomy normalization.
+    This keeps the final output inside a small set of clinically acceptable labels
+    and removes article-title noise copied by the LLM.
+    """
+    q = (case_text or "").lower()
+    ans = (answer or "").strip()
+    ans_l = ans.lower()
+
+    if not ans or ans_l == "evidence is insufficient":
+        return "Evidence is insufficient"
+
+    try:
+        f = _clinical_flags_v2(q)
+    except Exception:
+        f = {}
+
+    def has_any(terms):
+        return any(t in q for t in terms)
+
+    def ans_has_any(terms):
+        return any(t in ans_l for t in terms)
+
+    # Slowly progressive neurological symptoms are not acute stroke-oriented evidence
+    if has_any(["slowly progressive", "gradually worsening", "over three days", "over 3 days", "over two months", "over 2 months"]):
+        return "Evidence is insufficient"
+
+    # Remove unsupported rare article-title diagnoses
+    if ans_has_any([
+        "cardio-cerebral infarction",
+        "polyarteritis nodosa",
+        "choroidal infarction",
+        "central retinal artery occlusion",
+        "anterior ischemic optic neuropathy",
+        "radiation rhombencephalopathy",
+    ]):
+        if has_any(["sudden", "aphasia", "hemiplegia", "weakness", "facial droop", "gaze deviation"]):
+            return "Acute ischemic stroke"
+        return "Evidence is insufficient"
+
+    # Unsupported sudden deafness article-title noise
+    if "sudden deafness" in ans_l and "deafness" not in q and "hearing loss" not in q:
+        return "Acute posterior circulation / brainstem ischemic stroke"
+
+    # Posterior article-title variants
+    if ans_has_any(["lateral medullary", "basilar", "brainstem", "midbrain"]) and (
+        f.get("posterior_terms") or has_any(["diplopia", "vertigo", "ataxia", "dysarthria", "dysphagia", "unsteady gait"])
+    ):
+        return "Acute posterior circulation / brainstem ischemic stroke"
+
+    # Weird mixed anterior/posterior label from LLM
+    if "anteroposterior circulation" in ans_l:
+        if f.get("posterior_terms"):
+            return "Acute posterior circulation / brainstem ischemic stroke"
+        return "Acute ischemic stroke"
+
+    # Hemorrhage-compatible presentations should not end as ischemic stroke
+    anticoag = has_any(["warfarin", "apixaban", "rivaroxaban", "dabigatran", "anticoagulant"])
+    no_bleed_negation = has_any(["without headache", "no headache", "without trauma", "no trauma"])
+
+    if f.get("hemorrhage_terms") and not no_bleed_negation:
+        if has_any(["headache", "vomiting", "confusion", "very high blood pressure", "neck stiffness", "photophobia", "decreased consciousness"]):
+            return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+
+    if anticoag and not no_bleed_negation and has_any(["headache", "confusion", "hemiparesis", "vomiting", "decreased consciousness"]):
+        return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+
+    # Clean ischemic stroke answers with unsupported complications
+    if ans_has_any(["ischemic stroke", "ischaemic stroke", "infarction"]):
+        if f.get("posterior_terms"):
+            return "Acute posterior circulation / brainstem ischemic stroke"
+        return "Acute ischemic stroke"
+
+    # Clean TIA
+    if "transient ischemic attack" in ans_l or ans_l.strip() == "tia":
+        return "Transient ischemic attack"
+
+    # Clean hemorrhage
+    if ans_has_any(["subarachnoid", "hemorrhage", "haemorrhage", "intracranial bleed"]):
+        return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+
+    return ans
+
+
+
+
+# =========================================================
+# Clinical Rescue Fallback v1
+# =========================================================
+
+def _clinical_rescue_fallback(case_text: str, grounding: dict) -> str | None:
+    """
+    Deterministic rescue used only when the LLM output is unsafe/empty,
+    while the case has strong clinical compatibility and grounded evidence.
+    It preserves conservative behavior for mimics and weak grounding.
+    """
+    q = (case_text or "").lower()
+    grounding = grounding or {}
+
+    reason = grounding.get("reason")
+    strength = float(grounding.get("top_strength") or 0)
+    support = int(grounding.get("support_count") or 0)
+
+    evidence_ok = (
+        reason == "high_risk_grounded"
+        or (reason == "grounded" and strength >= 0.75 and support >= 5)
+    )
+
+    if not evidence_ok:
+        return None
+
+    try:
+        f = _clinical_flags_v2(q)
+    except Exception:
+        return None
+
+    def has_any(terms):
+        return any(t in q for t in terms)
+
+    # Keep mimics conservative
+    if (
+        f.get("migraine_aura")
+        or f.get("seizure_mimic")
+        or f.get("hypoglycemia_mimic")
+        or f.get("peripheral_facial_palsy")
+        or f.get("syncope_mimic")
+        or f.get("peripheral_vertigo_mimic")
+        or f.get("functional_mimic")
+        or f.get("pediatric_infection_mismatch")
+        or f.get("cardiac_out_of_domain")
+    ):
+        return None
+
+    # Trauma / subdural pattern
+    if f.get("trauma_bleed") or f.get("trauma_anticoag_bleed"):
+        return "Acute intracranial hemorrhage / traumatic subdural hemorrhage"
+
+    # Anticoagulated but explicitly without trauma/headache + focal deficit
+    if f.get("anticoag_without_bleed_features") and f.get("neuro_focal"):
+        return "Acute ischemic stroke"
+
+    # Transient focal symptoms
+    if f.get("retinal_tia"):
+        return "Transient ischemic attack"
+
+    if f.get("transient_terms") and f.get("neuro_focal") and not f.get("hemorrhage_terms"):
+        return "Transient ischemic attack"
+
+    # Hemorrhage-compatible presentation.
+    # Do not treat reduced alertness alone as hemorrhage because basilar/posterior stroke can also reduce alertness.
+    hemorrhage_core = (
+        has_any(["thunderclap", "worst headache", "neck stiffness", "photophobia"])
+        or (
+            "headache" in q
+            and has_any([
+                "vomiting",
+                "confusion",
+                "very high blood pressure",
+                "decreased consciousness",
+                "reduced alertness",
+                "hemiparesis",
+            ])
+        )
+    )
+
+    if hemorrhage_core:
+        return "Acute intracranial hemorrhage / subarachnoid hemorrhage"
+
+    # Visual field / occipital presentation
+    if has_any(["homonymous hemianopia", "visual field loss"]):
+        return "Posterior circulation ischemic stroke"
+
+    # Posterior circulation presentation
+    if f.get("posterior_terms"):
+        return "Acute posterior circulation / brainstem ischemic stroke"
+
+    # Classic acute focal ischemic stroke
+    if f.get("neuro_focal") and has_any(["sudden", "developed", "woke up", "last known well"]):
+        return "Acute ischemic stroke"
+
+    return None
+
+
 def get_answer(
     case_text: str,
     top_k: int | None = None,
     debug: bool = False,
     stroke_features: Optional[Dict] = None,
-    use_rules: bool = True,
+    use_rules: bool = False,
     use_llm: bool = False,
 ) -> Dict:
     case_text_en = case_text
 
+    # v7.12 Agentic Evidence-Based RAG mode.
+    # In this mode the final diagnosis is selected by an evidence judge using
+    # retrieved sources, KG metadata, and grounding. Legacy case-text diagnosis
+    # rules and the v7.11 subtype resolver are disabled unless the config asks
+    # for legacy fallback explicitly.
+    try:
+        agent_cfg = CFG.get("agentic_mode", {}) or {}
+        if bool(agent_cfg.get("enabled", False)):
+            from app.rag.agent_controller import run_medrag_agent
+            agent_out = run_medrag_agent(case_text_en, top_k=top_k, debug=debug)
+            return _attach_sourcecheckup_explanation(
+                agent_out,
+                case_text=case_text_en,
+                clinical_signals=(agent_out or {}).get("clinical_signals") if isinstance(agent_out, dict) else None,
+                sources=(agent_out or {}).get("sources") if isinstance(agent_out, dict) else None,
+                grounding=(agent_out or {}).get("grounding") if isinstance(agent_out, dict) else None,
+                legacy_fallback=False,
+            )
+    except Exception as e:
+        if debug:
+            print("Agentic mode failed; falling back to legacy pipeline:", repr(e))
+        try:
+            if not bool((CFG.get("agentic_mode", {}) or {}).get("allow_legacy_fallback_on_error", True)):
+                return _attach_sourcecheckup_explanation(
+                    {
+                        "answer": "Evidence is insufficient",
+                        "confidence": "منخفض",
+                        "top_score": 0.0,
+                        "sources": [],
+                        "pipeline_version": PIPELINE_VERSION,
+                        "used_fallback": True,
+                        "match_top": None,
+                        "grounding": {"allow_llm": False, "reason": "agentic_error"},
+                        "agent_error": repr(e),
+                        "agentic_mode": True,
+                    },
+                    case_text=case_text_en,
+                    sources=[],
+                    grounding={"allow_llm": False, "reason": "agentic_error"},
+                    legacy_fallback=False,
+                    agent_error=repr(e),
+                )
+        except Exception:
+            pass
+
+    try:
+        clinical_signals = detect_clinical_signals(case_text_en)
+    except Exception:
+        clinical_signals = detect_clinical_signals(case_text_en, use_model=False)
+
     if debug:
         print(f"Case text: {case_text}")
+        print("Pipeline clinical signals =", summarize_signals(clinical_signals))
 
     raw_k = top_k if top_k is not None else (CFG.get("retrieval") or {}).get("top_k_merged", 6)
     try:
@@ -706,15 +1621,26 @@ def get_answer(
                 print("Local search error:", e)
 
     if not merged_docs:
-        return {
-            "answer": "Evidence is insufficient",
-            "confidence": "منخفض",
-            "top_score": 0.0,
-            "sources": [],
-            "pipeline_version": PIPELINE_VERSION,
-            "used_fallback": True,
-            "match_top": None,
-        }
+        return _attach_sourcecheckup_explanation(
+            {
+                "answer": "Evidence is insufficient",
+                "confidence": "منخفض",
+                "top_score": 0.0,
+                "sources": [],
+                "pipeline_version": PIPELINE_VERSION,
+                "used_fallback": True,
+                "match_top": None,
+                "grounding": {"allow_llm": False, "reason": "no_sources"},
+                "clinical_signals": clinical_signals if "clinical_signals" in locals() else None,
+                "agentic_mode": False,
+            },
+            case_text=case_text_en,
+            clinical_signals=clinical_signals if "clinical_signals" in locals() else None,
+            sources=[],
+            grounding={"allow_llm": False, "reason": "no_sources"},
+            legacy_fallback=True,
+            agent_error=repr(e) if "e" in locals() else None,
+        )
 
     merged_docs = _dedup_docs(merged_docs)
 
@@ -858,20 +1784,22 @@ def get_answer(
         }
         sources.append(src)
 
-    if EMB is not None and sources:
-        try:
-            case_vec = EMB.encode([case_text_en], convert_to_numpy=True)[0]
-            doc_texts = [s.get("text") or s.get("snippet") or "" for s in sources]
-            doc_vecs = EMB.encode(doc_texts, convert_to_numpy=True)
+        if EMB is not None and sources:
+            try:
+                case_vec = EMB.encode([case_text_en], convert_to_numpy=True)[0]
+                doc_texts = [s.get("text") or s.get("snippet") or "" for s in sources]
+                doc_vecs = EMB.encode(doc_texts, convert_to_numpy=True)
 
-            for s, v in zip(sources, doc_vecs):
-                cos = _cosine_sim(case_vec, v)
-                cos = max(-1.0, min(1.0, cos))
-                s["match_cosine"] = float(round(cos, 4))
-                s["match_percent"] = float(round((cos * 100.0) if cos >= 0 else 0.0, 2))
+                for s, v in zip(sources, doc_vecs):
+                    cos = _cosine_sim(case_vec, v)
+                    cos = max(-1.0, min(1.0, cos))
+                    s["match_cosine"] = float(round(cos, 4))
+                    s["match_percent"] = float(round((cos * 100.0) if cos >= 0 else 0.0, 2))
 
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+    priority_for_case = lambda s: _final_source_priority_for_case(s, case_text_en)
 
     kg_sources = [
         s for s in sources
@@ -883,34 +1811,37 @@ def get_answer(
         if not (s.get("from_kg") or s.get("graph_score") is not None)
     ]
 
-    kg_sources = sorted(kg_sources, key=_final_source_priority, reverse=True)
-    non_kg_sources = sorted(non_kg_sources, key=_final_source_priority, reverse=True)
+    kg_sources = sorted(kg_sources, key=priority_for_case, reverse=True)
+    non_kg_sources = sorted(non_kg_sources, key=priority_for_case, reverse=True)
 
-    if kg_sources:
-        # المطلوب: فرض 1-2 KG على الأقل إذا موجودة.
-        # هنا نجعلها 2 افتراضيًا، ولا نلغي FAISS/BM25.
-        forced_kg_count = min(len(kg_sources), 2, k)
-        mixed_sources = kg_sources[:forced_kg_count] + non_kg_sources
+    # ==========================================================
+    # Balanced final source mix
+    # ==========================================================
+    # مهم:
+    # لا نكمّل القائمة من KG إذا non-KG قليل.
+    # لأن هذا كان سبب final KG sources count = 29 أو 30.
+    final_limit = max(1, k)
 
-        remaining_kg = kg_sources[forced_kg_count:]
-        mixed_sources = _dedup_docs(mixed_sources + remaining_kg)
+    max_kg_final = min(
+        len(kg_sources),
+        max(2, min(4, final_limit // 4 if final_limit >= 8 else 2))
+    )
 
-        sources = sorted(mixed_sources, key=_final_source_priority, reverse=True)
+    if kg_sources and non_kg_sources:
+        selected_kg = kg_sources[:max_kg_final]
+        selected_non_kg = non_kg_sources[:max(0, final_limit - len(selected_kg))]
 
-        # حماية نهائية: إذا الترتيب أسقط KG من أول k، نحقنها يدويًا.
-        final_sources = sources[:k]
-        final_has_kg = any(
-            s.get("from_kg") or s.get("graph_score") is not None
-            for s in final_sources
-        )
+        # لا نضيف remaining_kg هنا.
+        # إذا ما في non-KG كفاية، نخلي عدد sources أقل بدل ما نخلي KG يسيطر.
+        sources = _dedup_docs(selected_kg + selected_non_kg)[:final_limit]
 
-        if not final_has_kg and kg_sources:
-            final_sources = kg_sources[:forced_kg_count] + final_sources
-            final_sources = _dedup_docs(final_sources)[:k]
+    elif kg_sources:
+        # إذا كل الموجود KG، لا نرجع 30 KG.
+        # نعرض أفضل 2-4 KG فقط.
+        sources = kg_sources[:max_kg_final]
 
-        sources = final_sources
     else:
-        sources = non_kg_sources[:k]
+        sources = non_kg_sources[:final_limit]
 
     if debug:
         final_kg_count = sum(
@@ -947,9 +1878,15 @@ def get_answer(
         ]
 
         if kg_candidates:
-            best = max(kg_candidates, key=_final_source_priority)
+            best = max(
+                kg_candidates,
+                key=lambda s: _final_source_priority_for_case(s, case_text_en)
+            )
         else:
-            best = max(sources, key=_final_source_priority)
+            best = max(
+                sources,
+                key=lambda s: _final_source_priority_for_case(s, case_text_en)
+            )
 
         match_top = {
             "pmid": best.get("pmid"),
@@ -1011,12 +1948,90 @@ def get_answer(
                     )
 
                     extracted = _extract_llm_diagnosis(full_answer)
-                    if _llm_answer_is_safe(extracted):
-                        answer = extracted
-                    else:
-                        answer = "Evidence is insufficient"
+                    normalized = _normalize_llm_answer_from_evidence(
+                        extracted,
+                        case_text_en=case_text_en,
+                        grounding=grounding,
+                        best_doc=best_doc,
+                        sources=sources,
+                    )
 
-                    used_fallback = True
+                    normalized = _clinical_safety_normalize_answer(
+                        case_text_en if "case_text_en" in locals() else case_text,
+                        normalized,
+                        grounding,
+                        sources,
+                    )
+
+                    normalized = _final_taxonomy_normalize_answer(
+                        case_text_en if "case_text_en" in locals() else case_text,
+                        normalized,
+                        grounding,
+                        sources,
+                    )
+
+                    case_for_rescue = case_text_en if "case_text_en" in locals() else case_text
+                    rescue = _clinical_rescue_fallback(case_for_rescue, grounding)
+
+                    if _llm_answer_is_safe(normalized):
+                        answer = normalized
+
+                        if rescue:
+                            ans_l = (answer or "").strip().lower()
+                            rescue_l = rescue.lower()
+                            case_l = (case_for_rescue or "").lower()
+
+                            bleed_signal = any(t in case_l for t in [
+                                "thunderclap",
+                                "worst headache",
+                                "headache",
+                                "vomiting",
+                                "neck stiffness",
+                                "photophobia",
+                                "very high blood pressure",
+                                "fall",
+                                "head trauma",
+                                "minor head trauma",
+                                "warfarin",
+                                "apixaban",
+                                "rivaroxaban",
+                                "dabigatran",
+                            ])
+
+                            should_override = False
+
+                            if ans_l == "evidence is insufficient":
+                                should_override = True
+
+                            # More specific posterior/visual-field diagnosis can override generic ischemic stroke.
+                            if "posterior circulation" in rescue_l and ans_l in {
+                                "acute ischemic stroke",
+                                "acute ischemic stroke.",
+                            }:
+                                should_override = True
+
+                            # TIA can override non-TIA answer when transient focal symptoms are detected.
+                            if "transient ischemic attack" in rescue_l and "transient ischemic attack" not in ans_l:
+                                should_override = True
+
+                            # Traumatic SDH can override generic hemorrhage.
+                            if "traumatic subdural" in rescue_l and "traumatic subdural" not in ans_l:
+                                should_override = True
+
+                            # Hemorrhage can override ischemic/insufficient only when there are bleeding clues.
+                            if (
+                                "intracranial hemorrhage" in rescue_l
+                                and bleed_signal
+                                and ("ischemic stroke" in ans_l or ans_l == "evidence is insufficient")
+                            ):
+                                should_override = True
+
+                            if should_override:
+                                answer = rescue
+                    else:
+                        answer = rescue if rescue else "Evidence is insufficient"
+
+                    used_fallback = (answer == "Evidence is insufficient")
 
                 else:
                     answer = "Evidence is insufficient"
@@ -1033,6 +2048,49 @@ def get_answer(
     else:
         answer = "Evidence is insufficient"
         used_fallback = True
+
+    # Final deterministic rescue after all LLM paths.
+    # This handles cases where LLM generation failed or post-processing returned insufficient,
+    # while grounding and clinical compatibility are strong.
+    if answer == "Evidence is insufficient":
+        final_rescue = _clinical_rescue_fallback(
+            case_text_en if "case_text_en" in locals() else case_text,
+            grounding,
+        )
+        if final_rescue:
+            answer = final_rescue
+            used_fallback = False
+
+    subtype_resolution = None
+    try:
+        subtype_cfg = CFG.get("clinical_subtype_resolver", {}) or {}
+        subtype_enabled = bool(subtype_cfg.get("enabled", True))
+    except Exception:
+        subtype_enabled = True
+
+    if subtype_enabled and _HAS_SUBTYPE_RESOLVER and resolve_clinical_subtype is not None:
+        try:
+            subtype_resolution = resolve_clinical_subtype(
+                case_text_en if "case_text_en" in locals() else case_text,
+                answer,
+                grounding=grounding,
+                sources=sources,
+                clinical_signals=clinical_signals if "clinical_signals" in locals() else None,
+            )
+            if isinstance(subtype_resolution, dict):
+                new_answer = (subtype_resolution.get("answer") or answer).strip()
+                if new_answer:
+                    answer = new_answer
+                    used_fallback = (answer == "Evidence is insufficient")
+        except Exception as e:
+            if debug:
+                print("clinical_subtype_resolver failed:", repr(e))
+            subtype_resolution = {
+                "answer": answer,
+                "applied": False,
+                "subtype": None,
+                "reason": f"resolver_error: {e}",
+            }
 
     top_score = float(merged_docs[0].get("score", 0.0) or 0.0) if merged_docs else 0.0
     confidence = "متوسط" if top_score >= 0.35 else "منخفض"
@@ -1072,12 +2130,23 @@ def get_answer(
         "used_fallback": used_fallback,
         "match_top": match_top,
         "grounding": grounding,
+        "clinical_signals": clinical_signals if "clinical_signals" in locals() else None,
+        "clinical_subtype_resolution": subtype_resolution,
     }
 
     if stroke_risk is not None:
         out["stroke_risk"] = stroke_risk
 
-    return out
+    out["agentic_mode"] = False
+    return _attach_sourcecheckup_explanation(
+        out,
+        case_text=case_text_en if "case_text_en" in locals() else case_text,
+        clinical_signals=clinical_signals if "clinical_signals" in locals() else None,
+        sources=sources if "sources" in locals() else [],
+        grounding=grounding if "grounding" in locals() else {},
+        legacy_fallback=True,
+        agent_error=repr(e) if "e" in locals() else None,
+    )
 
 
 def get_stroke_answer(

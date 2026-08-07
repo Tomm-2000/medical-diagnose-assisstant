@@ -1,7 +1,7 @@
 # app/models/medcpt_reranker.py
 from __future__ import annotations
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 import os
 
 import torch

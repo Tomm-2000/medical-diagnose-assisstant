@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import json
 from pathlib import Path
 from py2neo import Graph, Node, Relationship
@@ -6,8 +6,13 @@ import re
 from tqdm import tqdm
 import scispacy
 import spacy
-from spacy import displacy
 import time
+
+try:
+    from app.rag.clinical_signals import detect_clinical_signals
+except Exception:
+    def detect_clinical_signals(text, use_model=False):
+        return {}
 
 # تحميل نموذج scispacy (يتطلب تثبيت النموذج مسبقاً)
 nlp = spacy.load("en_ner_bc5cdr_md")
@@ -47,6 +52,19 @@ class MedicalKnowledgeGraph:
             "infarction": "cerebral infarction",
             "cerebral infarction": "cerebral infarction",
             "brain infarction": "cerebral infarction",
+
+            # Specific posterior-circulation diagnoses.
+            "posterior circulation stroke": "posterior circulation stroke",
+            "posterior circulation ischemic stroke": "posterior circulation stroke",
+            "posterior circulation ischaemic stroke": "posterior circulation stroke",
+            "vertebrobasilar stroke": "posterior circulation stroke",
+
+            "brainstem infarction": "brainstem infarction",
+            "brainstem stroke": "brainstem infarction",
+
+            "cerebellar infarction": "cerebellar infarction",
+            "cerebellar stroke": "cerebellar infarction",
+
             "hypertension": "hypertension",
             "htn": "hypertension",
             "diabetes": "diabetes mellitus",
@@ -106,7 +124,23 @@ class MedicalKnowledgeGraph:
             "hypertension": "hypertension",
             "diabetes": "diabetes mellitus",
             "afib": "atrial fibrillation",
+            "a fib": "atrial fibrillation",
             "atrial fibrillation": "atrial fibrillation",
+            "diabetes mellitus": "diabetes mellitus",
+            "hyperlipidemia": "hyperlipidemia",
+            "hyperlipidaemia": "hyperlipidemia",
+            "htn": "hypertension",
+        }
+
+        # These concepts are medically valid diseases, but in this
+        # stroke decision-support KG they must not be treated as
+        # competing neurological diagnoses. They are stored as
+        # risk factors / comorbidities instead.
+        self.non_diagnostic_risk_concepts = {
+            "hypertension",
+            "diabetes mellitus",
+            "atrial fibrillation",
+            "hyperlipidemia",
         }
 
         # =========================
@@ -372,9 +406,309 @@ class MedicalKnowledgeGraph:
         term_norm = self._normalize_text(term)
         return mapping.get(term_norm, term_norm)
 
+    def _compile_term_pattern(self, term):
+        """
+        Build a safe whole-term regular expression.
+
+        This prevents abbreviations such as:
+        - TIA from matching "initial"
+        - ICH from matching "which"
+        - DM from matching "admission"
+        """
+        term_norm = self._normalize_text(term)
+
+        if not term_norm:
+            return None
+
+        pattern_body = re.escape(term_norm)
+
+        # Permit flexible whitespace inside multi-word terms.
+        pattern_body = pattern_body.replace(
+            r"\ ",
+            r"\s+"
+        )
+
+        return re.compile(
+            r"(?<!\w)"
+            + pattern_body
+            + r"(?!\w)",
+            flags=re.IGNORECASE
+        )
+
+    def _term_occurs(self, text, term):
+        """
+        Return True only when the complete term occurs.
+
+        Unlike: term in text
+        this method does not match abbreviations inside larger words.
+        """
+        text_norm = self._normalize_text(text)
+        pattern = self._compile_term_pattern(term)
+
+        if not text_norm or pattern is None:
+            return False
+
+        return bool(pattern.search(text_norm))
+
+    def _is_contextual_cva_stroke(self, text):
+        """
+        Disambiguate the acronym CVA.
+
+        CVA is accepted as cerebrovascular accident only when:
+        1. It is written as uppercase CVA.
+        2. Neurological or cerebrovascular context is present.
+        3. No strong competing scientific meaning is present.
+
+        This deliberately favors precision over recall.
+        """
+        raw_text = str(text or "")
+
+        cva_matches = list(
+            re.finditer(
+                r"(?<!\w)CVA(?!\w)",
+                raw_text
+            )
+        )
+
+        # Mixed-case cVA is commonly used for non-stroke meanings,
+        # such as the Drosophila pheromone.
+        if not cva_matches:
+            return False
+
+        exclusion_terms = [
+            "cva/ampc",
+            "clavulanic acid",
+            "clavulanate",
+            "amoxicillin",
+            "cell viability assay",
+            "drosophila",
+            "pheromone",
+            "craniovertebral angle",
+            "cranio-vertebral angle",
+            "crypt-villus axis",
+            "coefficient of additive genetic variance",
+            "sevoflurane",
+        ]
+
+        if any(
+            self._term_occurs(raw_text, term)
+            for term in exclusion_terms
+        ):
+            return False
+
+        neurological_context_terms = [
+            "stroke",
+            "cerebrovascular",
+            "brain attack",
+            "ischemic",
+            "ischaemic",
+            "infarct",
+            "infarction",
+            "hemiplegia",
+            "hemiparesis",
+            "aphasia",
+            "dysarthria",
+            "facial weakness",
+            "neurological deficit",
+            "cerebral",
+            "thrombolysis",
+            "thrombectomy",
+        ]
+
+        # Check a local context window around every CVA occurrence.
+        for match in cva_matches:
+            start = max(
+                0,
+                match.start() - 250
+            )
+
+            end = min(
+                len(raw_text),
+                match.end() + 250
+            )
+
+            context_window = raw_text[start:end]
+
+            if any(
+                self._term_occurs(
+                    context_window,
+                    term
+                )
+                for term
+                in neurological_context_terms
+            ):
+                return True
+
+        return False
+
     def _count_term_hits(self, text, terms):
-        low = self._normalize_text(text)
-        return sum(1 for t in terms if t in low)
+        """
+        Count complete term occurrences at the vocabulary level.
+
+        This replaces unsafe substring matching.
+        """
+        return sum(
+            1
+            for term in terms
+            if self._term_occurs(text, term)
+        )
+
+    def _infer_posterior_diagnoses(self, text):
+        """
+        Extract only explicit posterior-circulation diagnoses.
+
+        Basilar artery occlusion and vertebrobasilar occlusion are
+        vascular findings and must never be converted automatically
+        into posterior circulation stroke.
+        """
+        text = str(text or "")
+        normalized_text = self._normalize_text(text)
+
+        explicit_diagnoses = {
+            "posterior circulation stroke":
+                "posterior circulation stroke",
+
+            "posterior circulation ischemic stroke":
+                "posterior circulation stroke",
+
+            "posterior circulation ischaemic stroke":
+                "posterior circulation stroke",
+
+            "vertebrobasilar stroke":
+                "posterior circulation stroke",
+
+            "brainstem infarction":
+                "brainstem infarction",
+
+            "brainstem stroke":
+                "brainstem infarction",
+
+            "cerebellar infarction":
+                "cerebellar infarction",
+
+            "cerebellar stroke":
+                "cerebellar infarction",
+        }
+
+        diagnoses = []
+
+        for phrase, canonical in explicit_diagnoses.items():
+            if (
+                self._term_occurs(
+                    text,
+                    phrase
+                )
+                and not self._is_negated(
+                    normalized_text,
+                    phrase
+                )
+            ):
+                diagnoses.append(
+                    canonical
+                )
+
+        return list(
+            dict.fromkeys(diagnoses)
+        )
+
+    def extract_vascular_findings(self, text):
+        """
+        Extract vascular findings independently from diseases.
+
+        This relation represents that an article mentions the finding;
+        it does not claim that the finding is the final diagnosis or
+        that the article supports a diagnostic conclusion.
+
+        Excluded, therapeutic, animal, and clinical mentions remain
+        vascular-finding mentions and are distinguished later using
+        article metadata and evidence context.
+        """
+        text = str(text or "")
+
+        vascular_synonyms = {
+            "basilar artery occlusion":
+                "basilar artery occlusion",
+
+            "basilar occlusion":
+                "basilar artery occlusion",
+
+            "vertebrobasilar occlusion":
+                "vertebrobasilar occlusion",
+        }
+
+        findings = []
+
+        for phrase, canonical in vascular_synonyms.items():
+            if self._term_occurs(
+                text,
+                phrase
+            ):
+                findings.append(
+                    canonical
+                )
+
+        return list(
+            dict.fromkeys(findings)
+        )
+
+    def _apply_taxonomy_policy(self, entities):
+        """
+        Enforce the stroke-KG taxonomy after any extraction method.
+
+        Some medically valid diseases, such as hypertension and
+        diabetes mellitus, are risk factors or comorbidities in this
+        diagnostic system. They must not become competing neurological
+        diagnosis candidates.
+
+        This method also handles entities returned by SciSpacy.
+        """
+        entities = dict(entities or {})
+
+        diseases = list(
+            entities.get("diseases", []) or []
+        )
+
+        risk_factors = list(
+            entities.get("risk_factors", []) or []
+        )
+
+        configured_risk_concepts = getattr(
+            self,
+            "non_diagnostic_risk_concepts",
+            set()
+        ) or set()
+
+        risk_concepts = {
+            self._normalize_text(concept)
+            for concept in configured_risk_concepts
+            if self._normalize_text(concept)
+        }
+
+        diagnostic_diseases = []
+
+        for disease in diseases:
+            disease_normalized = self._normalize_text(
+                disease
+            )
+
+            if disease_normalized in risk_concepts:
+                risk_factors.append(disease)
+            else:
+                diagnostic_diseases.append(disease)
+
+        entities["diseases"] = list(
+            dict.fromkeys(diagnostic_diseases)
+        )
+
+        entities["risk_factors"] = list(
+            dict.fromkeys(risk_factors)
+        )
+
+        entities.setdefault("symptoms", [])
+        entities.setdefault("drugs", [])
+        entities.setdefault("vascular_findings", [])
+
+        return entities
 
     def _is_negated(self, text, phrase, window=5):
         """
@@ -429,6 +763,23 @@ class MedicalKnowledgeGraph:
         tumor_hits = self._count_term_hits(name, self.tumor_terms)
         noise_hits = self._count_term_hits(name, self.basic_science_noise_terms)
         rehab_hits = self._count_term_hits(name, self.rehabilitation_noise_terms)
+
+        # Clinical signal layer: complements the old term-hit rules.
+        # Model use stays disabled during KG build for speed/reproducibility;
+        # the rule layer remains the deterministic fallback.
+        try:
+            signals = detect_clinical_signals(name, use_model=False)
+        except Exception:
+            signals = {}
+
+        if signals.get("is_hemorrhage") and hemorrhage_hits == 0:
+            hemorrhage_hits = 1
+        if signals.get("is_posterior") and posterior_vascular_hits == 0 and posterior_anatomy_hits == 0:
+            posterior_anatomy_hits = 1
+        if signals.get("is_chronic_or_general"):
+            result["chronic_penalty"] = max(result["chronic_penalty"], 0.45)
+        if signals.get("is_mimic_or_nonstroke"):
+            mimic_hits = max(mimic_hits, 1)
 
         if hemorrhage_hits > 0:
             result.update({
@@ -555,6 +906,23 @@ class MedicalKnowledgeGraph:
         title_vascular_hits = self._count_term_hits(title_low, self.vascular_terms)
         title_posterior_hits = self._count_term_hits(title_low, self.posterior_vascular_terms)
         title_hemorrhage_hits = self._count_term_hits(title_low, self.hemorrhage_terms)
+
+        # Clinical signal layer over the article/chunk text.
+        # This is not a replacement for the curated rules; it adds a centralized
+        # signal detector that can later be backed by a transformer model.
+        try:
+            signals = detect_clinical_signals(full, use_model=False)
+        except Exception:
+            signals = {}
+
+        if signals.get("is_hemorrhage") and hemorrhage_hits == 0:
+            hemorrhage_hits = 1
+        if signals.get("is_posterior") and posterior_vascular_hits == 0:
+            posterior_vascular_hits = 1
+        if signals.get("is_chronic_or_general"):
+            rehab_hits = max(rehab_hits, 1)
+        if signals.get("is_mimic_or_nonstroke"):
+            mimic_hits = max(mimic_hits, 1)
 
         strong_basic_noise = (
             animal_noise_hits > 0
@@ -683,6 +1051,374 @@ class MedicalKnowledgeGraph:
 
         return result
 
+
+    # ============================================================
+    # v7.12.4 ontology KG relations
+    # ============================================================
+
+    def _extract_chunk_order(self, chunk_id):
+        """
+        Extract the numeric order from identifiers such as:
+        pmid_123_chunk_1
+
+        Unknown formats are placed after ordered chunks.
+        """
+        chunk_id_text = str(chunk_id or "")
+
+        match = re.search(
+            r"chunk[_-]?(\d+)$",
+            chunk_id_text,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            return int(match.group(1))
+
+        return 10 ** 9
+
+    def _longest_exact_chunk_overlap(
+        self,
+        previous_text,
+        current_text,
+        maximum=500
+    ):
+        """
+        Return the longest exact suffix-prefix overlap.
+
+        Example:
+            previous = "Alpha beta gamma delta"
+            current  = "gamma delta epsilon"
+
+        overlap:
+            "gamma delta"
+        """
+        previous = str(previous_text or "")
+        current = str(current_text or "")
+
+        maximum = min(
+            len(previous),
+            len(current),
+            int(maximum)
+        )
+
+        for length in range(maximum, 0, -1):
+            if previous[-length:] == current[:length]:
+                return length
+
+        return 0
+
+    def _reconstruct_article_chunks(self, chunks):
+        """
+        Reconstruct one article/abstract from its ordered chunks while
+        removing the exact overlap between adjacent chunks.
+        """
+        ordered_chunks = sorted(
+            list(chunks or []),
+            key=lambda row: (
+                self._extract_chunk_order(
+                    row.get("chunk_id")
+                ),
+                str(row.get("chunk_id") or "")
+            )
+        )
+
+        if not ordered_chunks:
+            return "", []
+
+        reconstructed = str(
+            ordered_chunks[0].get("text") or ""
+        )
+
+        ordered_chunk_ids = [
+            str(
+                ordered_chunks[0].get(
+                    "chunk_id"
+                ) or ""
+            )
+        ]
+
+        for row in ordered_chunks[1:]:
+            current_text = str(
+                row.get("text") or ""
+            )
+
+            ordered_chunk_ids.append(
+                str(row.get("chunk_id") or "")
+            )
+
+            overlap = (
+                self._longest_exact_chunk_overlap(
+                    reconstructed,
+                    current_text,
+                    maximum=500
+                )
+            )
+
+            if overlap > 0:
+                reconstructed += current_text[
+                    overlap:
+                ]
+            else:
+                # Preserve readable separation when no exact overlap
+                # can be detected.
+                if (
+                    reconstructed
+                    and current_text
+                    and not reconstructed[-1].isspace()
+                    and not current_text[0].isspace()
+                ):
+                    reconstructed += " "
+
+                reconstructed += current_text
+
+        return reconstructed, ordered_chunk_ids
+
+    def _prepare_article_level_records(self, rows):
+        """
+        Add article-level text and metadata to every chunk record.
+
+        Chunks sharing the same PMID receive the same:
+        - article_text
+        - article_full_text
+        - article_chunk_count
+        - article_chunk_ids
+
+        Missing PMIDs are intentionally treated as independent articles
+        using their chunk_id, so unrelated records are never mixed.
+        """
+        source_rows = [
+            dict(row or {})
+            for row in (rows or [])
+        ]
+
+        grouped_rows = {}
+
+        for position, row in enumerate(source_rows):
+            pmid = str(
+                row.get("pmid") or ""
+            ).strip()
+
+            chunk_id = str(
+                row.get("chunk_id")
+                or f"missing_chunk_{position}"
+            )
+
+            if pmid:
+                group_key = (
+                    "pmid",
+                    pmid
+                )
+            else:
+                group_key = (
+                    "chunk",
+                    chunk_id,
+                    position
+                )
+
+            grouped_rows.setdefault(
+                group_key,
+                []
+            ).append(row)
+
+        article_metadata = {}
+
+        for group_key, group in grouped_rows.items():
+            article_text, article_chunk_ids = (
+                self._reconstruct_article_chunks(
+                    group
+                )
+            )
+
+            ordered_group = sorted(
+                group,
+                key=lambda row: (
+                    self._extract_chunk_order(
+                        row.get("chunk_id")
+                    ),
+                    str(row.get("chunk_id") or "")
+                )
+            )
+
+            article_title = next(
+                (
+                    str(row.get("title") or "").strip()
+                    for row in ordered_group
+                    if str(
+                        row.get("title") or ""
+                    ).strip()
+                ),
+                ""
+            )
+
+            if article_title:
+                article_full_text = (
+                    article_title
+                    + "\n"
+                    + article_text
+                )
+            else:
+                article_full_text = article_text
+
+            article_metadata[group_key] = {
+                "article_title":
+                    article_title,
+
+                "article_text":
+                    article_text,
+
+                "article_full_text":
+                    article_full_text,
+
+                "article_chunk_count":
+                    len(group),
+
+                "article_chunk_ids":
+                    article_chunk_ids,
+            }
+
+        prepared_rows = []
+
+        for position, row in enumerate(source_rows):
+            pmid = str(
+                row.get("pmid") or ""
+            ).strip()
+
+            chunk_id = str(
+                row.get("chunk_id")
+                or f"missing_chunk_{position}"
+            )
+
+            if pmid:
+                group_key = (
+                    "pmid",
+                    pmid
+                )
+            else:
+                group_key = (
+                    "chunk",
+                    chunk_id,
+                    position
+                )
+
+            prepared_row = dict(row)
+
+            prepared_row.update(
+                article_metadata[group_key]
+            )
+
+            prepared_rows.append(
+                prepared_row
+            )
+
+        return prepared_rows
+
+    def infer_ontology_links(self, disease_name, title="", text="", disease_props=None, article_props=None):
+        """
+        Infer stable ontology-style links from a disease/article context.
+
+        These links are not used to create a diagnosis from a patient case.
+        They are built offline from article evidence to make Neo4j more clinically
+        structured than generic DISCUSSES / MENTIONS edges.
+        """
+        disease_props = disease_props or self.classify_disease(disease_name)
+        article_props = article_props or self.classify_article(title, text)
+        full = self._normalize_text(" ".join([str(disease_name or ""), str(title or ""), str(text or "")]))
+
+        families = set()
+        territories = set()
+        imaging_findings = set()
+
+        category = str(disease_props.get("category") or "").lower()
+        disease_low = self._normalize_text(disease_name)
+
+        if category == "hemorrhagic" or self._count_term_hits(full, self.hemorrhage_terms) > 0:
+            families.add("hemorrhagic stroke")
+        if category in {"vascular", "posterior_vascular"} or self._count_term_hits(full, self.vascular_terms) > 0:
+            # Keep TIA separate from tissue infarction.
+            if "transient ischemic attack" in full or re.search(r"\btia\b", full):
+                families.add("transient ischemic attack")
+            elif self._count_term_hits(full, ["ischemic", "ischaemic", "infarction", "infarct", "ischemia", "ischaemia"]) > 0:
+                families.add("ischemic stroke")
+            else:
+                families.add("stroke")
+
+        if category == "posterior_vascular" or self._count_term_hits(full, self.posterior_anatomy_terms + self.posterior_vascular_terms) > 0:
+            families.add("posterior circulation stroke")
+            territories.add("posterior circulation")
+        if any(t in full for t in ["vertebrobasilar", "basilar artery", "basilar"]):
+            territories.add("vertebrobasilar")
+        if any(t in full for t in ["brainstem", "midbrain", "pontine", "pons", "medullary", "lateral medullary"]):
+            territories.add("brainstem")
+        if any(t in full for t in ["cerebellar", "cerebellum", "pica", "aica", "superior cerebellar artery"]):
+            territories.add("cerebellum")
+        if any(t in full for t in ["middle cerebral artery", " mca ", "anterior circulation", "carotid", "cortical aphasia"]):
+            territories.add("anterior circulation")
+
+        if any(t in full for t in ["intracerebral hemorrhage", "intracerebral haemorrhage", "intraparenchymal hemorrhage", "intraparenchymal haemorrhage", "intraparenchymal hematoma", "parenchymal hematoma", "basal ganglia hemorrhage", "putaminal hemorrhage", "thalamic hemorrhage"]):
+            families.add("intracerebral hemorrhage")
+            imaging_findings.add("intraparenchymal hematoma")
+        if any(t in full for t in ["subarachnoid hemorrhage", "subarachnoid haemorrhage", "aneurysmal subarachnoid", "ruptured aneurysm", "basal cistern blood", "convexal subarachnoid"]):
+            families.add("subarachnoid hemorrhage")
+            imaging_findings.add("subarachnoid blood")
+        if any(t in full for t in ["dwi lesion", "diffusion restriction", "restricted diffusion", "infarct on mri", "mri confirmed infarct", "ct confirmed acute infarct", "imaging-confirmed infarction"]):
+            imaging_findings.add("imaging-confirmed infarction")
+        if any(t in full for t in ["large vessel occlusion", "arterial occlusion", "basilar artery occlusion", "mca occlusion", "middle cerebral artery occlusion"]):
+            imaging_findings.add("arterial occlusion")
+
+        # Article-level labels can contribute when disease names are too sparse.
+        if article_props.get("article_posterior_relevance", 0.0) >= 0.8:
+            territories.add("posterior circulation")
+        if article_props.get("article_hemorrhage_relevance", 0.0) >= 0.8:
+            families.add("hemorrhagic stroke")
+        if article_props.get("article_vascular_relevance", 0.0) >= 0.8 and not families:
+            families.add("stroke")
+
+        return {
+            "families": sorted(families),
+            "territories": sorted(territories),
+            "imaging_findings": sorted(imaging_findings),
+        }
+
+    def _merge_ontology_links(self, tx, article_node, disease_node, disease, entities, title, text, disease_props, article_props):
+        """Create ontology-style disease links while preserving legacy relations."""
+        links = self.infer_ontology_links(disease, title=title, text=text, disease_props=disease_props, article_props=article_props)
+
+        # Do not create SUPPORTS_DISEASE automatically.
+        #
+        # Entity detection proves only that an article mentions or discusses
+        # a disease. A support relationship requires separate claim-level
+        # evidence, provenance, and confidence.
+        for symptom in set(entities.get("symptoms", [])):
+            symptom_node = Node("Symptom", name=symptom)
+            tx.merge(symptom_node, "Symptom", "name")
+            tx.merge(Relationship(disease_node, "HAS_SYMPTOM", symptom_node))
+            tx.merge(Relationship(article_node, "MENTIONS_SYMPTOM", symptom_node))
+
+        for risk in set(entities.get("risk_factors", [])):
+            risk_node = Node("RiskFactor", name=risk)
+            tx.merge(risk_node, "RiskFactor", "name")
+            tx.merge(Relationship(disease_node, "HAS_RISK_FACTOR", risk_node))
+
+        for drug in set(entities.get("drugs", [])):
+            drug_node = Node("Drug", name=drug)
+            tx.merge(drug_node, "Drug", "name")
+            tx.merge(Relationship(disease_node, "ASSOCIATED_WITH_DRUG", drug_node))
+
+        for family in links["families"]:
+            family_node = Node("StrokeFamily", name=family)
+            tx.merge(family_node, "StrokeFamily", "name")
+            tx.merge(Relationship(disease_node, "IS_SUBTYPE_OF", family_node))
+
+        for territory in links["territories"]:
+            territory_node = Node("Territory", name=territory)
+            tx.merge(territory_node, "Territory", "name")
+            tx.merge(Relationship(disease_node, "AFFECTS_TERRITORY", territory_node))
+
+        for finding in links["imaging_findings"]:
+            finding_node = Node("ImagingFinding", name=finding)
+            tx.merge(finding_node, "ImagingFinding", "name")
+            tx.merge(Relationship(disease_node, "HAS_IMAGING_FINDING", finding_node))
+
     def clear_graph(self, batch_size=500, sleep_seconds=0.1):
         """مسح الرسم البياني على دفعات لتجنب MemoryPoolOutOfMemoryError."""
         total_deleted = 0
@@ -712,7 +1448,7 @@ class MedicalKnowledgeGraph:
 
     def drop_indexes(self):
         """تعطيل الفهارس الخاصة بالمشروع لتسريع الإدراج بطريقة متوافقة مع Neo4j 5+."""
-        target_labels = {"Disease", "Symptom", "Drug", "RiskFactor", "Article"}
+        target_labels = {"Disease", "Symptom", "Drug", "RiskFactor", "Article", "StrokeFamily", "Territory", "ImagingFinding"}
 
         try:
             result = self.graph.run("SHOW INDEXES")
@@ -755,6 +1491,9 @@ class MedicalKnowledgeGraph:
             "CREATE INDEX article_pmid_idx IF NOT EXISTS FOR (a:Article) ON (a.pmid)",
             "CREATE INDEX article_chunk_idx IF NOT EXISTS FOR (a:Article) ON (a.chunk_id)",
             "CREATE INDEX article_type_idx IF NOT EXISTS FOR (a:Article) ON (a.article_type)",
+            "CREATE INDEX strokefamily_name_idx IF NOT EXISTS FOR (f:StrokeFamily) ON (f.name)",
+            "CREATE INDEX territory_name_idx IF NOT EXISTS FOR (t:Territory) ON (t.name)",
+            "CREATE INDEX imagingfinding_name_idx IF NOT EXISTS FOR (i:ImagingFinding) ON (i.name)",
         ]
 
         try:
@@ -765,7 +1504,13 @@ class MedicalKnowledgeGraph:
             print(f"تحذير: فشل إنشاء الفهارس - {e}")
 
     def extract_entities(self, text):
-        """استخراج الكيانات الطبية من النص (نموذج مبسط + canonicalization + negation handling)"""
+        """
+        Extract medical entities using:
+        - whole-term matching,
+        - acronym disambiguation,
+        - canonicalization,
+        - basic negation handling.
+        """
         entities = {
             "diseases": [],
             "symptoms": [],
@@ -773,35 +1518,152 @@ class MedicalKnowledgeGraph:
             "risk_factors": []
         }
 
-        text_lower = self._normalize_text(text)
+        text_normalized = self._normalize_text(text)
 
-        disease_terms = list(self.disease_synonyms.keys())
-        symptom_terms = list(self.symptom_synonyms.keys())
-        drug_terms = list(self.drug_synonyms.keys())
-        risk_factor_terms = list(self.risk_factor_synonyms.keys())
+        disease_terms = list(
+            self.disease_synonyms.keys()
+        )
 
-        for d in disease_terms:
-            if d in text_lower and not self._is_negated(text_lower, d):
-                entities["diseases"].append(self._canonicalize_term(d, self.disease_synonyms))
+        symptom_terms = list(
+            self.symptom_synonyms.keys()
+        )
 
-        for s in symptom_terms:
-            if s in text_lower and not self._is_negated(text_lower, s):
-                entities["symptoms"].append(self._canonicalize_term(s, self.symptom_synonyms))
+        drug_terms = list(
+            self.drug_synonyms.keys()
+        )
 
-        for dr in drug_terms:
-            if dr in text_lower and not self._is_negated(text_lower, dr):
-                entities["drugs"].append(self._canonicalize_term(dr, self.drug_synonyms))
+        risk_factor_terms = list(
+            self.risk_factor_synonyms.keys()
+        )
 
-        for r in risk_factor_terms:
-            if r in text_lower and not self._is_negated(text_lower, r):
-                entities["risk_factors"].append(self._canonicalize_term(r, self.risk_factor_synonyms))
+        for disease_term in disease_terms:
+            normalized_term = self._normalize_text(
+                disease_term
+            )
 
-        entities["diseases"] = list(dict.fromkeys(entities["diseases"]))
-        entities["symptoms"] = list(dict.fromkeys(entities["symptoms"]))
-        entities["drugs"] = list(dict.fromkeys(entities["drugs"]))
-        entities["risk_factors"] = list(dict.fromkeys(entities["risk_factors"]))
+            if normalized_term == "cva":
+                matched = (
+                    self._is_contextual_cva_stroke(text)
+                )
+            else:
+                matched = self._term_occurs(
+                    text_normalized,
+                    disease_term
+                )
 
-        return entities
+            if (
+                matched
+                and not self._is_negated(
+                    text_normalized,
+                    disease_term
+                )
+            ):
+                canonical_disease = (
+                    self._canonicalize_term(
+                        disease_term,
+                        self.disease_synonyms
+                    )
+                )
+
+                entities["diseases"].append(
+                    canonical_disease
+                )
+
+        for symptom_term in symptom_terms:
+            if (
+                self._term_occurs(
+                    text_normalized,
+                    symptom_term
+                )
+                and not self._is_negated(
+                    text_normalized,
+                    symptom_term
+                )
+            ):
+                entities["symptoms"].append(
+                    self._canonicalize_term(
+                        symptom_term,
+                        self.symptom_synonyms
+                    )
+                )
+
+        for drug_term in drug_terms:
+            if (
+                self._term_occurs(
+                    text_normalized,
+                    drug_term
+                )
+                and not self._is_negated(
+                    text_normalized,
+                    drug_term
+                )
+            ):
+                entities["drugs"].append(
+                    self._canonicalize_term(
+                        drug_term,
+                        self.drug_synonyms
+                    )
+                )
+
+        for risk_term in risk_factor_terms:
+            if (
+                self._term_occurs(
+                    text_normalized,
+                    risk_term
+                )
+                and not self._is_negated(
+                    text_normalized,
+                    risk_term
+                )
+            ):
+                entities["risk_factors"].append(
+                    self._canonicalize_term(
+                        risk_term,
+                        self.risk_factor_synonyms
+                    )
+                )
+
+        entities["diseases"] = list(
+            dict.fromkeys(entities["diseases"])
+        )
+
+        entities["symptoms"] = list(
+            dict.fromkeys(entities["symptoms"])
+        )
+
+        entities["drugs"] = list(
+            dict.fromkeys(entities["drugs"])
+        )
+
+        entities["risk_factors"] = list(
+            dict.fromkeys(
+                entities["risk_factors"]
+            )
+        )
+
+        posterior_diseases = (
+            self._infer_posterior_diagnoses(
+                text
+            )
+        )
+
+        entities["diseases"].extend(
+            posterior_diseases
+        )
+
+        entities["diseases"] = list(
+            dict.fromkeys(
+                entities["diseases"]
+            )
+        )
+
+        entities["vascular_findings"] = (
+            self.extract_vascular_findings(
+                text
+            )
+        )
+
+        return self._apply_taxonomy_policy(entities)
 
     def extract_entities_scispacy(self, text):
         """استخراج الكيانات باستخدام scispacy (لنص واحد) + canonicalization"""
@@ -838,84 +1700,292 @@ class MedicalKnowledgeGraph:
             "risk_factors": entities_old.get("risk_factors", [])
         }
 
-        return combined
+        combined["vascular_findings"] = (
+            self.extract_vascular_findings(
+                text
+            )
+        )
 
-    def build_from_chunks(self, chunks_dir, limit=None, batch_size=64, disable_indexes=True):
+        return self._apply_taxonomy_policy(combined)
+
+    def build_from_chunks(
+        self,
+        chunks_dir,
+        limit=None,
+        batch_size=64,
+        disable_indexes=True
+    ):
         """
-        بناء الرسم البياني من الـ chunks مع تحسينات الأداء.
+        Build the KG while extracting and classifying entities at
+        complete-article level.
+
+        A separate Article node is retained for every chunk because
+        retrieval uses chunk_id, but chunks sharing one PMID receive
+        the same article-level entities and classification.
         """
-        chunk_files = list(Path(chunks_dir).glob("*.json"))
+        chunk_files = sorted(
+            Path(chunks_dir).glob("*.json")
+        )
+
         if limit:
             chunk_files = chunk_files[:limit]
 
         total_chunks = len(chunk_files)
-        print(f"بدء بناء الرسم البياني من {total_chunks} chunk (قد يستغرق وقتاً طويلاً)")
 
+        print(
+            "Starting graph build from "
+            f"{total_chunks} chunks."
+        )
+
+        raw_rows = []
+
+        for chunk_file in tqdm(
+            chunk_files,
+            desc="Reading chunk files"
+        ):
+            with open(
+                chunk_file,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                data = json.load(file)
+
+            raw_rows.append({
+                "pmid":
+                    data.get("pmid"),
+
+                "title":
+                    data.get("title", "") or "",
+
+                "text":
+                    data.get("text", "") or "",
+
+                "chunk_id":
+                    str(
+                        data.get("chunk_id")
+                        or chunk_file.stem
+                    ),
+            })
+
+        # Critical policy:
+        # aggregate the complete dataset before entity extraction.
+        articles_data = (
+            self._prepare_article_level_records(
+                raw_rows
+            )
+        )
+
+        if not articles_data:
+            raise RuntimeError(
+                "No valid chunk records were loaded."
+            )
+
+        unique_pmids = {
+            str(row.get("pmid") or "").strip()
+            for row in articles_data
+            if str(
+                row.get("pmid") or ""
+            ).strip()
+        }
+
+        print(
+            "Article-level preparation complete | "
+            f"chunks={len(articles_data)} | "
+            f"unique_pmids={len(unique_pmids)}"
+        )
+
+        # Do not alter Neo4j until the source files have been read and
+        # article-level aggregation has completed successfully.
         if disable_indexes:
             self.drop_indexes()
 
-        articles_data = []
+        print(
+            "Extracting article-level entities "
+            "with SciSpacy and rule policy..."
+        )
 
-        for chunk_file in tqdm(chunk_files, desc="قراءة ملفات الـ chunks"):
-            with open(chunk_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            text = data.get("text", "")
-            title = data.get("title", "")
-            pmid = data.get("pmid")
-            chunk_id = data.get("chunk_id") or chunk_file.stem
-            full_text = title + " " + text
-
-            articles_data.append((pmid, title, text, full_text, chunk_id))
-
-        print("بدء استخراج الكيانات باستخدام scispacy (بالمعالجة المجمعة)...")
         all_entities = []
 
-        for i in range(0, len(articles_data), batch_size):
-            batch = articles_data[i:i + batch_size]
-            batch_texts = [item[3] for item in batch]
-            docs = list(nlp.pipe(batch_texts, batch_size=batch_size))
+        for start in range(
+            0,
+            len(articles_data),
+            batch_size
+        ):
+            batch = articles_data[
+                start:start + batch_size
+            ]
 
-            for j, doc in enumerate(docs):
-                entities_scispacy = {"diseases": [], "drugs": []}
+            batch_texts = [
+                row["article_full_text"]
+                for row in batch
+            ]
 
-                for ent in doc.ents:
-                    ent_text = self._normalize_text(ent.text)
+            docs = list(
+                nlp.pipe(
+                    batch_texts,
+                    batch_size=batch_size
+                )
+            )
 
-                    if ent.label_ == "DISEASE":
-                        if not self._is_negated(batch_texts[j], ent_text):
-                            entities_scispacy["diseases"].append(
-                                self._canonicalize_term(ent_text, self.disease_synonyms)
+            for position, doc in enumerate(docs):
+                article_full_text = batch_texts[
+                    position
+                ]
+
+                entities_scispacy = {
+                    "diseases": [],
+                    "drugs": [],
+                }
+
+                for entity in doc.ents:
+                    entity_text = self._normalize_text(
+                        entity.text
+                    )
+
+                    if entity.label_ == "DISEASE":
+                        if not self._is_negated(
+                            article_full_text,
+                            entity_text
+                        ):
+                            entities_scispacy[
+                                "diseases"
+                            ].append(
+                                self._canonicalize_term(
+                                    entity_text,
+                                    self.disease_synonyms
+                                )
                             )
-                    elif ent.label_ == "CHEMICAL":
-                        if not self._is_negated(batch_texts[j], ent_text):
-                            entities_scispacy["drugs"].append(
-                                self._canonicalize_term(ent_text, self.drug_synonyms)
+
+                    elif entity.label_ == "CHEMICAL":
+                        if not self._is_negated(
+                            article_full_text,
+                            entity_text
+                        ):
+                            entities_scispacy[
+                                "drugs"
+                            ].append(
+                                self._canonicalize_term(
+                                    entity_text,
+                                    self.drug_synonyms
+                                )
                             )
 
-                entities_old = self.extract_entities(batch_texts[j])
+                rule_entities = self.extract_entities(
+                    article_full_text
+                )
 
                 combined = {
-                    "diseases": list(set(entities_scispacy.get("diseases", []) + entities_old.get("diseases", []))),
-                    "symptoms": entities_old.get("symptoms", []),
-                    "drugs": list(set(entities_scispacy.get("drugs", []) + entities_old.get("drugs", []))),
-                    "risk_factors": entities_old.get("risk_factors", [])
+                    "diseases": list(
+                        set(
+                            entities_scispacy.get(
+                                "diseases",
+                                []
+                            )
+                            + rule_entities.get(
+                                "diseases",
+                                []
+                            )
+                        )
+                    ),
+
+                    "symptoms":
+                        rule_entities.get(
+                            "symptoms",
+                            []
+                        ),
+
+                    "drugs": list(
+                        set(
+                            entities_scispacy.get(
+                                "drugs",
+                                []
+                            )
+                            + rule_entities.get(
+                                "drugs",
+                                []
+                            )
+                        )
+                    ),
+
+                    "risk_factors":
+                        rule_entities.get(
+                            "risk_factors",
+                            []
+                        ),
+
+                    "vascular_findings":
+                        self.extract_vascular_findings(
+                            article_full_text
+                        ),
                 }
+
+                # SciSpacy output must obey the same stroke taxonomy.
+                combined = self._apply_taxonomy_policy(
+                    combined
+                )
 
                 all_entities.append(combined)
 
-        print("إنشاء العقد والعلاقات في Neo4j...")
+        print(
+            "Creating chunk nodes and article-level "
+            "relationships in Neo4j..."
+        )
+
         batch_insert_size = 500
 
-        for start_idx in tqdm(range(0, len(articles_data), batch_insert_size), desc="إدراج دفعات"):
-            end_idx = min(start_idx + batch_insert_size, len(articles_data))
+        for start_idx in tqdm(
+            range(
+                0,
+                len(articles_data),
+                batch_insert_size
+            ),
+            desc="Inserting graph batches"
+        ):
+            end_idx = min(
+                start_idx + batch_insert_size,
+                len(articles_data)
+            )
+
             tx = self.graph.begin()
 
             try:
-                for idx in range(start_idx, end_idx):
-                    (pmid, title, text, _, chunk_id), entities = articles_data[idx], all_entities[idx]
+                for idx in range(
+                    start_idx,
+                    end_idx
+                ):
+                    row = articles_data[idx]
+                    entities = all_entities[idx]
 
-                    article_props = self.classify_article(title, text)
+                    pmid = row.get("pmid")
+
+                    title = (
+                        row.get("article_title")
+                        or row.get("title")
+                        or ""
+                    )
+
+                    article_text = (
+                        row.get("article_text")
+                        or row.get("text")
+                        or ""
+                    )
+
+                    chunk_id = str(
+                        row.get("chunk_id") or ""
+                    )
+
+                    article_chunk_count = int(
+                        row.get(
+                            "article_chunk_count",
+                            1
+                        )
+                        or 1
+                    )
+
+                    article_props = self.classify_article(
+                        title,
+                        article_text
+                    )
 
                     article_node = Node(
                         "Article",
@@ -923,65 +1993,250 @@ class MedicalKnowledgeGraph:
                         title=title,
                         chunk_id=chunk_id,
                         source="PubMed",
-                        article_type=article_props["article_type"],
-                        article_emergency_relevance=float(article_props["article_emergency_relevance"]),
-                        article_vascular_relevance=float(article_props["article_vascular_relevance"]),
-                        article_posterior_relevance=float(article_props["article_posterior_relevance"]),
-                        article_hemorrhage_relevance=float(article_props["article_hemorrhage_relevance"]),
-                        article_noise_penalty=float(article_props["article_noise_penalty"]),
+                        article_chunk_count=
+                            article_chunk_count,
+                        article_type=
+                            article_props[
+                                "article_type"
+                            ],
+                        article_emergency_relevance=
+                            float(
+                                article_props[
+                                    "article_emergency_relevance"
+                                ]
+                            ),
+                        article_vascular_relevance=
+                            float(
+                                article_props[
+                                    "article_vascular_relevance"
+                                ]
+                            ),
+                        article_posterior_relevance=
+                            float(
+                                article_props[
+                                    "article_posterior_relevance"
+                                ]
+                            ),
+                        article_hemorrhage_relevance=
+                            float(
+                                article_props[
+                                    "article_hemorrhage_relevance"
+                                ]
+                            ),
+                        article_noise_penalty=
+                            float(
+                                article_props[
+                                    "article_noise_penalty"
+                                ]
+                            ),
                     )
 
-                    tx.merge(article_node, "Article", "chunk_id")
+                    tx.merge(
+                        article_node,
+                        "Article",
+                        "chunk_id"
+                    )
 
-                    for disease in set(entities["diseases"]):
-                        disease_props = self.classify_disease(disease)
+                    for disease in set(
+                        entities["diseases"]
+                    ):
+                        disease_props = (
+                            self.classify_disease(
+                                disease
+                            )
+                        )
 
                         disease_node = Node(
                             "Disease",
                             name=disease,
-                            category=disease_props["category"],
-                            acuity=disease_props["acuity"],
-                            vascular_relevance=float(disease_props["vascular_relevance"]),
-                            posterior_relevance=float(disease_props["posterior_relevance"]),
-                            hemorrhage_relevance=float(disease_props["hemorrhage_relevance"]),
-                            emergency_relevance=float(disease_props["emergency_relevance"]),
-                            chronic_penalty=float(disease_props["chronic_penalty"]),
-                            noise_penalty=float(disease_props["noise_penalty"]),
+                            category=
+                                disease_props[
+                                    "category"
+                                ],
+                            acuity=
+                                disease_props[
+                                    "acuity"
+                                ],
+                            vascular_relevance=
+                                float(
+                                    disease_props[
+                                        "vascular_relevance"
+                                    ]
+                                ),
+                            posterior_relevance=
+                                float(
+                                    disease_props[
+                                        "posterior_relevance"
+                                    ]
+                                ),
+                            hemorrhage_relevance=
+                                float(
+                                    disease_props[
+                                        "hemorrhage_relevance"
+                                    ]
+                                ),
+                            emergency_relevance=
+                                float(
+                                    disease_props[
+                                        "emergency_relevance"
+                                    ]
+                                ),
+                            chronic_penalty=
+                                float(
+                                    disease_props[
+                                        "chronic_penalty"
+                                    ]
+                                ),
+                            noise_penalty=
+                                float(
+                                    disease_props[
+                                        "noise_penalty"
+                                    ]
+                                ),
                         )
 
-                        tx.merge(disease_node, "Disease", "name")
-                        rel = Relationship(article_node, "DISCUSSES", disease_node)
-                        tx.merge(rel)
+                        tx.merge(
+                            disease_node,
+                            "Disease",
+                            "name"
+                        )
 
-                    for symptom in set(entities["symptoms"]):
-                        symptom_node = Node("Symptom", name=symptom)
-                        tx.merge(symptom_node, "Symptom", "name")
-                        rel = Relationship(article_node, "MENTIONS", symptom_node)
-                        tx.merge(rel)
+                        tx.merge(
+                            Relationship(
+                                article_node,
+                                "DISCUSSES",
+                                disease_node
+                            )
+                        )
 
-                    for drug in set(entities["drugs"]):
-                        drug_node = Node("Drug", name=drug)
-                        tx.merge(drug_node, "Drug", "name")
-                        rel = Relationship(article_node, "REFERENCES", drug_node)
-                        tx.merge(rel)
+                        self._merge_ontology_links(
+                            tx,
+                            article_node,
+                            disease_node,
+                            disease,
+                            entities,
+                            title,
+                            article_text,
+                            disease_props,
+                            article_props,
+                        )
 
-                    for risk in set(entities["risk_factors"]):
-                        risk_node = Node("RiskFactor", name=risk)
-                        tx.merge(risk_node, "RiskFactor", "name")
-                        rel = Relationship(article_node, "ASSOCIATED_WITH", risk_node)
-                        tx.merge(rel)
+                    for symptom in set(
+                        entities["symptoms"]
+                    ):
+                        symptom_node = Node(
+                            "Symptom",
+                            name=symptom
+                        )
+
+                        tx.merge(
+                            symptom_node,
+                            "Symptom",
+                            "name"
+                        )
+
+                        tx.merge(
+                            Relationship(
+                                article_node,
+                                "MENTIONS",
+                                symptom_node
+                            )
+                        )
+
+                    for drug in set(
+                        entities["drugs"]
+                    ):
+                        drug_node = Node(
+                            "Drug",
+                            name=drug
+                        )
+
+                        tx.merge(
+                            drug_node,
+                            "Drug",
+                            "name"
+                        )
+
+                        tx.merge(
+                            Relationship(
+                                article_node,
+                                "REFERENCES",
+                                drug_node
+                            )
+                        )
+
+                    for risk in set(
+                        entities["risk_factors"]
+                    ):
+                        risk_node = Node(
+                            "RiskFactor",
+                            name=risk
+                        )
+
+                        tx.merge(
+                            risk_node,
+                            "RiskFactor",
+                            "name"
+                        )
+
+                        tx.merge(
+                            Relationship(
+                                article_node,
+                                "ASSOCIATED_WITH",
+                                risk_node
+                            )
+                        )
+
+                    for finding in set(
+                        entities.get(
+                            "vascular_findings",
+                            []
+                        )
+                        or []
+                    ):
+                        if not finding:
+                            continue
+
+                        finding_node = Node(
+                            "VascularFinding",
+                            name=finding
+                        )
+
+                        tx.merge(
+                            finding_node,
+                            "VascularFinding",
+                            "name"
+                        )
+
+                        tx.merge(
+                            Relationship(
+                                article_node,
+                                "MENTIONS_VASCULAR_FINDING",
+                                finding_node
+                            )
+                        )
 
                 tx.commit()
 
-            except Exception as e:
+            except Exception as error:
                 tx.rollback()
-                print(f"خطأ في الدفعة {start_idx}-{end_idx}: {e}. إعادة المحاولة بعد 5 ثوان...")
-                time.sleep(5)
+
+                print(
+                    "Batch error "
+                    f"{start_idx}-{end_idx}: "
+                    f"{error}"
+                )
+
+                raise
 
         if disable_indexes:
             self.recreate_indexes()
 
-        print(f"تم بناء الرسم البياني من {len(articles_data)} chunk")
+        print(
+            "Graph build completed | "
+            f"chunks={len(articles_data)} | "
+            f"unique_pmids={len(unique_pmids)}"
+        )
 
     def _score_symptom_query_row(
         self,
@@ -1055,12 +2310,26 @@ class MedicalKnowledgeGraph:
         is_hemorrhage=False,
     ):
         query = """
-        MATCH (s:Symptom)<-[:MENTIONS]-(a:Article)-[:DISCUSSES]->(d:Disease)
-        WHERE s.name IN $symptoms
+        CALL {
+            MATCH (s:Symptom)<-[:MENTIONS|MENTIONS_SYMPTOM]-(a:Article)-[:DISCUSSES|SUPPORTS_DISEASE]->(d:Disease)
+            WHERE s.name IN $symptoms
+            RETURN d, a, s
+            UNION
+            MATCH (d:Disease)-[:HAS_SYMPTOM]->(s:Symptom)
+            WHERE s.name IN $symptoms
+            OPTIONAL MATCH (d)<-[:DISCUSSES|SUPPORTS_DISEASE]-(a:Article)
+            RETURN d, a, s
+        }
+        OPTIONAL MATCH (d)-[:IS_SUBTYPE_OF]->(sf:StrokeFamily)
+        OPTIONAL MATCH (d)-[:AFFECTS_TERRITORY]->(t:Territory)
+        OPTIONAL MATCH (d)-[:HAS_IMAGING_FINDING]->(im:ImagingFinding)
         WITH d,
              COUNT(DISTINCT a) as frequency,
              COUNT(DISTINCT s) as matched_symptoms_count,
              COLLECT(DISTINCT a.pmid) as articles,
+             COLLECT(DISTINCT sf.name) as stroke_families,
+             COLLECT(DISTINCT t.name) as territories,
+             COLLECT(DISTINCT im.name) as imaging_findings,
              avg(coalesce(a.article_emergency_relevance, 0.0)) as article_emergency_relevance,
              avg(coalesce(a.article_vascular_relevance, 0.0)) as article_vascular_relevance,
              avg(coalesce(a.article_posterior_relevance, 0.0)) as article_posterior_relevance,
@@ -1070,6 +2339,9 @@ class MedicalKnowledgeGraph:
                frequency,
                matched_symptoms_count,
                articles,
+               stroke_families,
+               territories,
+               imaging_findings,
                coalesce(d.category, 'unknown') as category,
                coalesce(d.acuity, 'unknown') as acuity,
                coalesce(d.vascular_relevance, 0.0) as vascular_relevance,
@@ -1118,11 +2390,17 @@ class MedicalKnowledgeGraph:
     def get_related_articles(self, disease=None, symptom=None, limit=5):
         if disease:
             query = """
-            MATCH (d:Disease {name: $disease})<-[:DISCUSSES]-(a:Article)
+            MATCH (d:Disease {name: $disease})<-[:DISCUSSES|SUPPORTS_DISEASE]-(a:Article)
+            OPTIONAL MATCH (d)-[:IS_SUBTYPE_OF]->(sf:StrokeFamily)
+            OPTIONAL MATCH (d)-[:AFFECTS_TERRITORY]->(t:Territory)
+            OPTIONAL MATCH (d)-[:HAS_IMAGING_FINDING]->(im:ImagingFinding)
             RETURN a.pmid as pmid,
                    a.title as title,
                    a.chunk_id as chunk_id,
                    a.article_type as article_type,
+                   COLLECT(DISTINCT sf.name) as stroke_families,
+                   COLLECT(DISTINCT t.name) as territories,
+                   COLLECT(DISTINCT im.name) as imaging_findings,
                    coalesce(a.article_emergency_relevance, 0.0) as article_emergency_relevance,
                    coalesce(a.article_vascular_relevance, 0.0) as article_vascular_relevance,
                    coalesce(a.article_posterior_relevance, 0.0) as article_posterior_relevance,
@@ -1146,12 +2424,18 @@ class MedicalKnowledgeGraph:
 
         elif symptom:
             query = """
-            MATCH (s:Symptom {name: $symptom})<-[:MENTIONS]-(a:Article)
-            OPTIONAL MATCH (a)-[:DISCUSSES]->(d:Disease)
+            MATCH (s:Symptom {name: $symptom})<-[:MENTIONS|MENTIONS_SYMPTOM]-(a:Article)
+            OPTIONAL MATCH (a)-[:DISCUSSES|SUPPORTS_DISEASE]->(d:Disease)
+            OPTIONAL MATCH (d)-[:IS_SUBTYPE_OF]->(sf:StrokeFamily)
+            OPTIONAL MATCH (d)-[:AFFECTS_TERRITORY]->(t:Territory)
+            OPTIONAL MATCH (d)-[:HAS_IMAGING_FINDING]->(im:ImagingFinding)
             RETURN a.pmid as pmid,
                    a.title as title,
                    a.chunk_id as chunk_id,
                    a.article_type as article_type,
+                   COLLECT(DISTINCT sf.name) as stroke_families,
+                   COLLECT(DISTINCT t.name) as territories,
+                   COLLECT(DISTINCT im.name) as imaging_findings,
                    coalesce(a.article_emergency_relevance, 0.0) as article_emergency_relevance,
                    coalesce(a.article_vascular_relevance, 0.0) as article_vascular_relevance,
                    coalesce(a.article_posterior_relevance, 0.0) as article_posterior_relevance,
@@ -1177,6 +2461,90 @@ class MedicalKnowledgeGraph:
             return []
 
         return [dict(record) for record in result]
+
+
+    def backfill_ontology_links(self, batch_size=500, sleep_seconds=0.05):
+        """
+        Add v7.12.4 ontology-style relationships to an existing Neo4j graph
+        without deleting or rebuilding the Article/Disease/Symptom nodes.
+
+        This is a migration/backfill helper. A full rebuild remains the cleanest
+        path, but this lets you upgrade the current graph quickly.
+        """
+        total = 0
+        skip = 0
+
+        print("بدء backfill لعلاقات ontology فوق الغراف الحالي...")
+
+        while True:
+            rows = self.graph.run(
+                """
+                MATCH (a:Article)-[:DISCUSSES]->(d:Disease)
+                OPTIONAL MATCH (a)-[:MENTIONS]->(s:Symptom)
+                OPTIONAL MATCH (a)-[:REFERENCES]->(drug:Drug)
+                OPTIONAL MATCH (a)-[:ASSOCIATED_WITH]->(risk:RiskFactor)
+                RETURN a.chunk_id AS chunk_id,
+                       a.pmid AS pmid,
+                       a.title AS title,
+                       d.name AS disease,
+                       COLLECT(DISTINCT s.name) AS symptoms,
+                       COLLECT(DISTINCT drug.name) AS drugs,
+                       COLLECT(DISTINCT risk.name) AS risk_factors
+                SKIP $skip
+                LIMIT $batch_size
+                """,
+                skip=skip,
+                batch_size=batch_size,
+            ).data()
+
+            if not rows:
+                break
+
+            tx = self.graph.begin()
+            try:
+                for row in rows:
+                    disease = row.get("disease")
+                    chunk_id = row.get("chunk_id")
+                    if not disease or not chunk_id:
+                        continue
+
+                    title = row.get("title") or ""
+                    entities = {
+                        "symptoms": [x for x in (row.get("symptoms") or []) if x],
+                        "drugs": [x for x in (row.get("drugs") or []) if x],
+                        "risk_factors": [x for x in (row.get("risk_factors") or []) if x],
+                    }
+                    disease_props = self.classify_disease(disease)
+                    article_props = self.classify_article(title, "")
+
+                    article_node = Node("Article", chunk_id=chunk_id, pmid=row.get("pmid"), title=title)
+                    disease_node = Node("Disease", name=disease)
+                    tx.merge(article_node, "Article", "chunk_id")
+                    tx.merge(disease_node, "Disease", "name")
+                    self._merge_ontology_links(
+                        tx,
+                        article_node,
+                        disease_node,
+                        disease,
+                        entities,
+                        title,
+                        "",
+                        disease_props,
+                        article_props,
+                    )
+
+                tx.commit()
+            except Exception as e:
+                tx.rollback()
+                print(f"تحذير: فشل backfill عند skip={skip}: {e}")
+
+            total += len(rows)
+            skip += batch_size
+            print(f"تمت معالجة {total} Article-Disease pairs")
+            time.sleep(sleep_seconds)
+
+        self.recreate_indexes()
+        print("انتهى backfill لعلاقات ontology")
 
 
 if __name__ == "__main__":

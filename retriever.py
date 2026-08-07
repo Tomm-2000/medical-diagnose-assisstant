@@ -16,6 +16,9 @@ from sentence_transformers import SentenceTransformer
 import joblib
 
 from app.rag.utils_text import safe_truncate
+from app.rag.clinical_signals import detect_clinical_signals, build_dynamic_query_expansions, summarize_signals
+from app.rag.hybrid_feedback import build_hybrid_feedback, search_index_with_vector
+from app.rag.common_utils import _contains_arabic
 
 # ---------------- Config ----------------
 with open("config.yaml", "r", encoding="utf-8") as f:
@@ -61,6 +64,12 @@ KG_URI_IN_USE = None
 _KG_INIT_ATTEMPTED = False
 _KG_LAST_ERROR = None
 
+# ========== Hybrid Feedback / Pseudo-Relevance Feedback ==========
+# This is the v7.10 hybrid retrieval upgrade. It is deliberately optional and
+# has a full fallback to the existing v7.8/v7.9 retrieval path if anything fails.
+HYB_FB_CFG = (CFG.get("hybrid_feedback") or CFG.get("semantic_feedback") or {})
+USE_HYBRID_FEEDBACK = bool(HYB_FB_CFG.get("enabled", False))
+
 # ---------------- Regex / Tokens ----------------
 _AR_RE = re.compile(r"[\u0600-\u06FF]")
 _PMID_RE = re.compile(r"\bPMID:\s*(\d{6,9})\b", re.IGNORECASE)
@@ -90,14 +99,17 @@ MOTOR_TERMS = [
     "weakness", "unilateral weakness", "arm weakness", "leg weakness",
     "hemiparesis", "hemiplegia",
 ]
+
 LANGUAGE_TERMS = [
     "aphasia", "speech disturbance", "speech", "dysarthria", "slurred",
 ]
+
 POSTERIOR_TERMS = [
     "vertigo", "diplopia", "double vision", "ataxia", "dizziness",
     "gait difficulty", "difficulty walking", "nystagmus", "imbalance",
     "brainstem", "cerebellar", "posterior circulation",
 ]
+
 HEMORRHAGE_TERMS = [
     "hemorrhage", "haemorrhage", "bleeding", "intracerebral hemorrhage",
     "subarachnoid hemorrhage", "sah", "ich", "thunderclap", "worst headache",
@@ -273,45 +285,7 @@ def _search_kg_fresh(query: str, top_k: int, debug: bool = False) -> List[Dict]:
     return []
 
 
-def _search_kg_fresh(query: str, top_k: int, debug: bool = False) -> List[Dict]:
-    """
-    ينشئ اتصالًا جديدًا لكل عملية KG search لتجنب مشاكل session/socket lifecycle.
-    """
-    global KG_URI_IN_USE, _KG_INIT_ATTEMPTED, _KG_LAST_ERROR
-
-    if not USE_KG:
-        return []
-
-    _KG_INIT_ATTEMPTED = True
-    candidate_uris = _candidate_kg_uris(KG_CFG.get("uri", "bolt://localhost:7687"))
-
-    last_error = None
-    for candidate_uri in candidate_uris:
-        for attempt in range(2):
-            try:
-                gr = _instantiate_graph_retriever(candidate_uri)
-                KG_URI_IN_USE = candidate_uri
-                _KG_LAST_ERROR = None
-                if debug:
-                    print(f"✅ KG query via {candidate_uri} (attempt {attempt + 1})")
-                return gr.search(query, top_k=top_k)
-            except Exception as e:
-                last_error = e
-                _KG_LAST_ERROR = e
-                if debug:
-                    print(f"⚠️ KG failed via {candidate_uri} (attempt {attempt + 1}): {e!r}")
-                time.sleep(0.25)
-
-    if debug and last_error is not None:
-        print(f"⚠️ فشل KG search نهائيًا: {last_error}")
-    return []
-
-
 # ---------------- Helpers ----------------
-def _contains_arabic(text: str) -> bool:
-    return bool(_AR_RE.search(text or ""))
-
-
 def _extract_time_context(query: str) -> Dict:
     q = (query or "").lower()
 
@@ -384,26 +358,31 @@ def _extract_time_context(query: str) -> Dict:
 
 
 def _query_is_acute(q: str) -> bool:
+    """
+    Backward-compatible acute detector.
+    The legacy keyword logic is now wrapped by the clinical_signals layer,
+    so the old terms remain a fallback/explainability source rather than
+    the only decision layer.
+    """
     t = (q or "").strip()
     if not t:
         return False
 
-    low = t.lower()
-    time_ctx = _extract_time_context(low)
+    try:
+        return bool(detect_clinical_signals(t, use_model=False).get("is_acute"))
+    except Exception:
+        low = t.lower()
+        time_ctx = _extract_time_context(low)
 
-    if time_ctx.get("is_chronic_time"):
-        return False
-
-    if time_ctx.get("is_acute_time"):
-        return True
-
-    if _contains_arabic(t):
-        return any(w in low for w in AR_ACUTE_HINTS)
-
-    if any(w in low for w in ACUTE_HINT_TERMS):
-        return True
-
-    return any(w in low for w in ["stroke", "tia", "fast", "act"])
+        if time_ctx.get("is_chronic_time"):
+            return False
+        if time_ctx.get("is_acute_time"):
+            return True
+        if _contains_arabic(t):
+            return any(w in low for w in AR_ACUTE_HINTS)
+        if any(w in low for w in ACUTE_HINT_TERMS):
+            return True
+        return any(w in low for w in ["stroke", "tia", "fast", "act"])
 
 
 def _extract_ids(text: str):
@@ -435,6 +414,160 @@ def _chronic_penalty(text: str) -> float:
     hits = min(_count_hits(text, CHRONIC_OR_GENERAL_PENALTY_TERMS), 10)
     return 0.03 * hits
 
+def _extract_query_age(query_low: str) -> Optional[int]:
+    patterns = [
+        r"\b(\d{1,3})\s*[- ]?year[- ]old\b",
+        r"\b(\d{1,3})\s*years?\s*old\b",
+        r"\b(\d{1,3})\s*y/o\b",
+        r"\b(\d{1,3})\s*yo\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, query_low or "")
+        if not m:
+            continue
+
+        try:
+            age = int(m.group(1))
+            if 0 <= age <= 120:
+                return age
+        except Exception:
+            continue
+
+    return None
+
+
+def _query_is_adult(query_low: str) -> bool:
+    age = _extract_query_age(query_low)
+
+    return bool(
+        (age is not None and age >= 18)
+        or any(t in (query_low or "") for t in [
+            "adult", "man", "woman", "male", "female",
+            "elderly", "older adult", "old man", "old woman"
+        ])
+    )
+
+
+def _article_has_pediatric_signal(title: str, text: str) -> bool:
+    combined = f"{title or ''} {text or ''}".lower()
+
+    return bool(
+        any(t in combined for t in [
+            "child",
+            "children",
+            "childhood",
+            "pediatric",
+            "paediatric",
+            "infant",
+            "newborn",
+            "neonate",
+            "adolescent",
+            "boy",
+            "girl",
+        ])
+        or re.search(r"\b([0-9]|1[0-7])\s*[- ]?year[- ]old\b", combined)
+        or re.search(r"\b([0-9]|1[0-7])\s*years?\s*old\b", combined)
+    )
+
+
+def _article_has_fever_or_infection_signal(title: str, text: str) -> bool:
+    combined = f"{title or ''} {text or ''}".lower()
+
+    return any(t in combined for t in [
+        "fever",
+        "febrile",
+        "infection",
+        "infectious",
+        "meningitis",
+        "encephalitis",
+        "cryptococcosis",
+        "sepsis",
+        "fungal",
+        "bacterial",
+        "viral",
+    ])
+
+
+def _query_has_fever_or_infection(query_low: str) -> bool:
+    return any(t in (query_low or "") for t in [
+        "fever",
+        "febrile",
+        "infection",
+        "infectious",
+        "meningitis",
+        "encephalitis",
+        "sepsis",
+        "fungal",
+        "bacterial",
+        "viral",
+    ])
+
+
+def _should_skip_clinical_mismatch(title: str, text: str, query_low: str) -> bool:
+    """
+    Hard clinical gate:
+    adult case should not use pediatric case reports as top evidence.
+    """
+    if _query_is_adult(query_low) and _article_has_pediatric_signal(title, text):
+        return True
+
+    return False
+
+
+def _clinical_mismatch_penalty(title: str, text: str, query_low: str) -> float:
+    """
+    Soft penalty for clinically mismatched articles.
+    This affects ranking but does not necessarily skip the article.
+    """
+    penalty = 0.0
+
+    if _query_is_adult(query_low) and _article_has_pediatric_signal(title, text):
+        penalty += 1.40
+
+    if _article_has_fever_or_infection_signal(title, text) and not _query_has_fever_or_infection(query_low):
+        penalty += 0.55
+
+    return penalty
+
+
+def _is_kg_item(item: Dict) -> bool:
+    return bool(
+        item.get("_from_graph")
+        or item.get("graph_score") is not None
+        or item.get("source") == "GraphKB"
+    )
+
+
+def _kg_raw_top_k(k: int) -> int:
+    """
+    Prevent KG from returning huge raw pools like 270 when pipeline asks for 90.
+    """
+    configured = (KG_CFG or {}).get("raw_top_k")
+    if configured is not None:
+        try:
+            return max(12, int(configured))
+        except Exception:
+            pass
+
+    return max(12, min(60, int(k)))
+
+
+def _kg_return_cap(k: int) -> int:
+    """
+    Maximum KG items allowed in hybrid_search final output.
+    For k=90 => about 30 KG max.
+    For k=15 => about 5 KG max.
+    """
+    ratio = float((KG_CFG or {}).get("max_return_ratio", 0.35))
+    hard_cap = int((KG_CFG or {}).get("max_return_cap", 30))
+
+    cap = int(round(max(1, k) * ratio))
+    cap = max(2, cap)
+    cap = min(hard_cap, cap)
+    cap = min(max(1, k), cap)
+
+    return cap
 
 def _faiss_search(query: str, k_candidates: int) -> List[Tuple[int, float]]:
     q_vec = EMB.encode([query], normalize_embeddings=True).astype("float32")
@@ -534,59 +667,167 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
     keep_dense = 250
     keep_bm25 = 400
 
-    query_is_acute = _query_is_acute(q)
     q_low = q.lower()
 
-    query_has_motor = any(t in q_low for t in [
-        "weakness", "unilateral weakness", "arm weakness", "leg weakness",
-        "hemiparesis", "hemiplegia"
-    ])
-    query_has_language = any(t in q_low for t in [
-        "aphasia", "speech", "dysarthria", "slurred"
-    ])
-    query_has_posterior = any(t in q_low for t in POSTERIOR_TERMS)
-    query_has_hemorrhage = any(t in q_low for t in HEMORRHAGE_TERMS)
+    try:
+        clinical_signals = detect_clinical_signals(q)
+    except Exception:
+        clinical_signals = detect_clinical_signals(q, use_model=False)
 
+    query_is_acute = bool(clinical_signals.get("is_acute"))
+    query_has_motor = bool(clinical_signals.get("has_motor"))
+    query_has_language = bool(clinical_signals.get("has_language"))
+    query_has_posterior = bool(clinical_signals.get("is_posterior"))
+    query_has_hemorrhage = bool(clinical_signals.get("is_hemorrhage"))
+
+    # v7.10: Hybrid pseudo-relevance feedback.
+    # First-stage retrieval is collected from ALL available channels:
+    #   - FAISS dense search
+    #   - BM25 lexical search
+    #   - Knowledge Graph search
+    # Then the feedback layer builds:
+    #   - a refined dense vector for second-stage FAISS,
+    #   - an evidence-derived text query for second-stage BM25/KG.
+    # Rule-based expansions remain fallback/safety only.
     queries = [q]
-    if _contains_arabic(q):
-        queries.append(q + " " + DEFAULT_STROKE_EXPANSION)
-    else:
-        if query_is_acute:
-            queries.append(q + " acute ischemic stroke sudden onset within hours slurred speech dysarthria hemiparesis")
+    feedback_query = ""
+    hybrid_feedback_info = {
+        "enabled": bool(USE_HYBRID_FEEDBACK),
+        "used": False,
+        "reason": "disabled",
+    }
 
-    if query_has_motor:
-        queries += [
-            q + " arm weakness",
-            q + " leg weakness",
-            q + " unilateral weakness",
-            q + " hemiparesis",
-        ]
-    if query_has_language:
-        queries += [
-            q + " aphasia",
-            q + " speech disturbance",
-            q + " dysarthria",
-            q + " slurred speech",
-        ]
-    if query_has_posterior:
-        queries += [
-            q + " posterior circulation stroke",
-            q + " brainstem stroke",
-            q + " cerebellar stroke",
-            q + " vertigo diplopia ataxia",
-        ]
-    if query_has_hemorrhage:
-        queries += [
-            q + " intracerebral hemorrhage",
-            q + " subarachnoid hemorrhage",
-            q + " thunderclap headache vomiting decreased consciousness",
-        ]
-
-    if query_has_motor or query_has_language:
-        queries += [q + " FAST", q + " act fast", q + " stroke symptoms", q + " facial droop"]
+    use_rule_expansions = bool(
+        (CFG.get("clinical_signals") or {}).get("use_dynamic_query_expansion", True)
+    )
+    rule_expansion_mode = str(
+        HYB_FB_CFG.get("rule_expansion_mode", "fallback")
+    ).strip().lower()
 
     dense_merged: Dict[int, float] = {}
+
+    # Stage 1A — FAISS original-query seed.
+    initial_dense_pairs = _faiss_search(q, k_candidates_dense)
+    for idx, dist_or_score in initial_dense_pairs:
+        if idx < 0 or idx >= len(_metas):
+            continue
+        sim = _to_similarity(dist_or_score)
+        dense_merged[idx] = max(dense_merged.get(idx, -1e9), sim)
+
+    # Stage 1B — BM25 original-query seed.
+    initial_bm25_pairs: List[Tuple[int, float]] = []
+    if USE_BM25 and _bm25 is not None:
+        initial_bm25_pairs = _bm25_search(q, k_candidates_bm25)
+
+    # Stage 1C — KG original-query seed.
+    # We call it early only when hybrid feedback wants KG evidence, then reuse
+    # the same graph_results later so Neo4j is not queried twice unnecessarily.
+    kg_raw_limit = _kg_raw_top_k(k)
+    graph_results: List[Dict] = []
+    if USE_HYBRID_FEEDBACK and bool(HYB_FB_CFG.get("use_kg_feedback", True)):
+        graph_results = _search_kg_fresh(q, top_k=kg_raw_limit, debug=debug)
+
+    # Stage 2 — Build feedback from FAISS + BM25 + KG evidence.
+    if USE_HYBRID_FEEDBACK:
+        refined_vec, feedback_query, hybrid_feedback_info = build_hybrid_feedback(
+            query=q,
+            embedder=EMB,
+            metas=_metas,
+            dense_pairs=initial_dense_pairs[: int(HYB_FB_CFG.get("dense_seed_pool", 80))],
+            bm25_pairs=initial_bm25_pairs[: int(HYB_FB_CFG.get("bm25_seed_pool", 80))],
+            kg_results=graph_results[: int(HYB_FB_CFG.get("kg_seed_pool", 40))],
+            pmid_to_meta_indices=_pmid_to_meta_indices,
+            feedback_docs_per_channel=int(HYB_FB_CFG.get("feedback_docs_per_channel", 6)),
+            alpha=float(HYB_FB_CFG.get("alpha", 0.75)),
+            beta=float(HYB_FB_CFG.get("beta", 0.25)),
+            max_doc_chars=int(HYB_FB_CFG.get("max_doc_chars", 1200)),
+            max_terms=int(HYB_FB_CFG.get("max_terms", 14)),
+            debug=debug,
+        )
+
+        if refined_vec is not None:
+            feedback_pairs = search_index_with_vector(
+                _index,
+                refined_vec,
+                int(HYB_FB_CFG.get("k_final_dense", k_candidates_dense)),
+            )
+            for idx, dist_or_score in feedback_pairs:
+                if idx < 0 or idx >= len(_metas):
+                    continue
+                sim = _to_similarity(dist_or_score)
+                dense_merged[idx] = max(
+                    dense_merged.get(idx, -1e9),
+                    sim + float(HYB_FB_CFG.get("feedback_dense_bonus", 0.03)),
+                )
+
+        # BM25/KG second-stage query is evidence-derived, not expert-template.
+        if hybrid_feedback_info.get("used") and feedback_query and feedback_query != q:
+            queries.append(feedback_query)
+
+    hybrid_feedback_used = bool(hybrid_feedback_info.get("used"))
+
+    should_apply_rule_expansions = (
+        use_rule_expansions
+        and (
+            not USE_HYBRID_FEEDBACK
+            or rule_expansion_mode == "always"
+            or (rule_expansion_mode == "fallback" and not hybrid_feedback_used)
+        )
+    )
+
+    if should_apply_rule_expansions:
+        # v7.8 rule expansions are fallback/explainability. They are not the
+        # primary retrieval mechanism when hybrid feedback succeeds.
+        for expansion in build_dynamic_query_expansions(q, clinical_signals):
+            queries.append(q + " " + expansion)
+
+        if query_has_motor:
+            queries += [
+                q + " arm weakness",
+                q + " leg weakness",
+                q + " unilateral weakness",
+                q + " hemiparesis",
+            ]
+        if query_has_language:
+            queries += [
+                q + " aphasia",
+                q + " speech disturbance",
+                q + " dysarthria",
+                q + " slurred speech",
+            ]
+        if query_has_posterior:
+            queries += [
+                q + " posterior circulation stroke",
+                q + " brainstem stroke",
+                q + " cerebellar stroke",
+                q + " vertigo diplopia ataxia",
+            ]
+        if query_has_hemorrhage:
+            queries += [
+                q + " intracerebral hemorrhage",
+                q + " subarachnoid hemorrhage",
+                q + " thunderclap headache vomiting decreased consciousness",
+            ]
+
+        if query_has_motor or query_has_language:
+            queries += [q + " FAST", q + " act fast", q + " stroke symptoms", q + " facial droop"]
+
+    queries = list(dict.fromkeys(queries))
+
+    if debug:
+        print("Clinical signals =", summarize_signals(clinical_signals))
+        print("Hybrid feedback =", hybrid_feedback_info)
+        print("Hybrid feedback query =", feedback_query[:500] if feedback_query else "")
+        print("Rule expansion mode =", rule_expansion_mode)
+        print("Rule expansions applied =", should_apply_rule_expansions)
+        print("Query count for BM25/fallback dense =", len(queries))
+
+    # If rule expansions are active, add their dense results too. If hybrid
+    # feedback succeeded and mode=fallback, this loop only adds evidence-derived
+    # feedback query results, not manual expert-system templates.
     for qq in queries:
+        if qq == q:
+            continue
         for idx, dist_or_score in _faiss_search(qq, k_candidates_dense):
             if idx < 0 or idx >= len(_metas):
                 continue
@@ -630,6 +871,7 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
         score = (w_dense * s_dense) + (w_bm25 * s_bm25)
 
         score = score + _acute_bonus(txt) - _chronic_penalty(txt)
+        score -= _clinical_mismatch_penalty(title, txt, q_low)
 
         acute_hits = _count_hits(txt, ACUTE_HINT_TERMS)
         if query_is_acute and acute_hits == 0:
@@ -675,16 +917,55 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
             "text": txt,
             "snippet": safe_truncate(txt, 350),
             "score": float(score),
+            "dense_score": float(s_dense),
+            "bm25_score": float(s_bm25),
+            "base_hybrid_score": float((w_dense * s_dense) + (w_bm25 * s_bm25)),
+            "hybrid_score": float(score),
+            "from_dense": bool(idx in dense_norm),
+            "from_bm25": bool(idx in bm25_norm),
+            "from_kg": False,
+            "retrieval_channel": "hybrid",
+            "retrieval_views": [name for name, enabled in (("dense", idx in dense_norm), ("bm25", idx in bm25_norm)) if enabled],
             "chunk_id": meta.get("chunk_id", meta.get("id", int(idx))),
             "_has_motor": has_motor,
             "_has_language": has_language,
             "_has_posterior": has_posterior,
             "_has_hemorrhage": has_hemorrhage,
+            "clinical_signals": summarize_signals(clinical_signals),
+            "hybrid_feedback": hybrid_feedback_info,
             "_from_graph": False,
         })
 
     # ========== إضافة نتائج Knowledge Graph ==========
-    graph_results = _search_kg_fresh(q, top_k=max(k * 3, 12), debug=debug)
+    # Reuse KG results collected for hybrid feedback when available. If not
+    # collected earlier, query KG now with the original case. When hybrid
+    # feedback succeeds, optionally run a second-stage KG search with the
+    # evidence-derived feedback query and merge both pools.
+    kg_raw_limit = _kg_raw_top_k(k)
+    if not graph_results:
+        graph_results = _search_kg_fresh(q, top_k=kg_raw_limit, debug=debug)
+
+    if (
+        USE_KG
+        and hybrid_feedback_used
+        and feedback_query
+        and feedback_query != q
+        and bool(HYB_FB_CFG.get("second_stage_kg", True))
+    ):
+        kg_feedback_results = _search_kg_fresh(feedback_query, top_k=kg_raw_limit, debug=debug)
+        if kg_feedback_results:
+            merged_kg: Dict[str, Dict] = {}
+            for item in list(graph_results) + list(kg_feedback_results):
+                key = str(item.get("chunk_id") or item.get("pmid") or item.get("title") or id(item))
+                prev = merged_kg.get(key)
+                if prev is None:
+                    merged_kg[key] = item
+                    continue
+                old_score = float(prev.get("graph_score", 0.0) or 0.0)
+                new_score = float(item.get("graph_score", 0.0) or 0.0)
+                if new_score > old_score:
+                    merged_kg[key] = item
+            graph_results = list(merged_kg.values())
 
     if debug:
         print(f"KG raw results count = {len(graph_results)}")
@@ -727,6 +1008,12 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
             txt_low = txt.lower()
             title = g.get("title") or support_meta.get("title", "") or ""
             title_low = title.lower()
+            if _should_skip_clinical_mismatch(title, txt, q_low):
+                if debug:
+                    print(
+                        f"KG skip: clinical age mismatch | PMID {pmid} | title={title}"
+                    )
+                continue
 
             graph_score = float(g.get("graph_score", 0.0) or 0.0)
             category = str(g.get("category", "") or "").lower()
@@ -740,6 +1027,7 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
             article_noise_penalty = float(g.get("article_noise_penalty", 0.0) or 0.0)
 
             score = w_graph * float(norm_g)
+            score -= _clinical_mismatch_penalty(title, txt, q_low)
 
             # KG clinical boost
             if query_is_acute:
@@ -792,8 +1080,17 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
                 "text": txt,
                 "snippet": safe_truncate(txt, 350),
                 "score": float(score),
+                "hybrid_score": float(score),
+                "dense_score": None,
+                "bm25_score": None,
+                "from_dense": False,
+                "from_bm25": False,
+                "from_kg": True,
+                "retrieval_channel": "kg",
+                "retrieval_views": ["kg"],
                 "chunk_id": support_meta.get("chunk_id", support_meta.get("id")),
                 "graph_score": graph_score,
+                "kg_paths": list(g.get("kg_paths") or []),
                 "graph_disease": g.get("disease"),
                 "graph_matched_symptoms": g.get("matched_symptoms", []),
                 "graph_category": g.get("category"),
@@ -804,6 +1101,8 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
                 "_has_language": any(t in txt_low for t in LANGUAGE_TERMS),
                 "_has_posterior": any(t in txt_low for t in POSTERIOR_TERMS),
                 "_has_hemorrhage": any(t in txt_low for t in HEMORRHAGE_TERMS),
+                "clinical_signals": summarize_signals(clinical_signals),
+                "hybrid_feedback": hybrid_feedback_info,
                 "_from_graph": True,
             })
             kg_added += 1
@@ -868,36 +1167,73 @@ def hybrid_search(query: str, top_k: int | None = None, debug: bool = False):
         ]
         print("Top graph-contributing results =", top_graph)
 
+        # =================================================
+    # Focus-aware final ordering + KG quota
+    # =================================================
     if query_has_motor and query_has_language:
         both = [r for r in results if r.get("_has_motor") and r.get("_has_language")]
         motor_only = [r for r in results if r.get("_has_motor") and not r.get("_has_language")]
         lang_only = [r for r in results if r.get("_has_language") and not r.get("_has_motor")]
 
-        final = []
+        focus_ordered = []
         if both:
-            final = both[:k]
+            focus_ordered = both + motor_only + lang_only
         else:
             i = 0
-            while len(final) < k and (i < len(motor_only) or i < len(lang_only)):
+            while i < max(len(motor_only), len(lang_only)):
                 if i < len(motor_only):
-                    final.append(motor_only[i])
-                    if len(final) >= k:
-                        break
+                    focus_ordered.append(motor_only[i])
                 if i < len(lang_only):
-                    final.append(lang_only[i])
-                    if len(final) >= k:
-                        break
+                    focus_ordered.append(lang_only[i])
                 i += 1
+
+        used = {
+            str(r.get("chunk_id")) if r.get("chunk_id") else f"pmid::{r.get('pmid')}::{r.get('title', '')}"
+            for r in focus_ordered
+        }
+        focus_ordered += [
+            r for r in results
+            if (
+                str(r.get("chunk_id")) if r.get("chunk_id") else f"pmid::{r.get('pmid')}::{r.get('title', '')}"
+            ) not in used
+        ]
+
     elif query_has_posterior:
         posterior_first = [r for r in results if r.get("_has_posterior")]
         others = [r for r in results if not r.get("_has_posterior")]
-        final = (posterior_first + others)[:k]
+        focus_ordered = posterior_first + others
+
     elif query_has_hemorrhage:
         hemorrhage_first = [r for r in results if r.get("_has_hemorrhage")]
         others = [r for r in results if not r.get("_has_hemorrhage")]
-        final = (hemorrhage_first + others)[:k]
+        focus_ordered = hemorrhage_first + others
+
     else:
-        final = results[:k]
+        focus_ordered = results
+
+    max_kg_final = _kg_return_cap(k)
+
+    final = []
+    kg_count = 0
+    seen_final = set()
+
+    for r in focus_ordered:
+        key = str(r.get("chunk_id")) if r.get("chunk_id") else f"pmid::{r.get('pmid')}::{r.get('title', '')}"
+        if key in seen_final:
+            continue
+
+        is_kg = _is_kg_item(r)
+
+        if is_kg:
+            if kg_count >= max_kg_final:
+                continue
+            kg_count += 1
+
+        final.append(r)
+        seen_final.add(key)
+
+        if len(final) >= k:
+            break
 
     for r in final:
         r.pop("_has_motor", None)

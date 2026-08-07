@@ -167,70 +167,133 @@ def llama_cpp_chat(system_prompt: str, user_prompt: str, model_name: str) -> str
 # ========== Hugging Face API (محسّن مع debug) ==========
 def generate_answer_hf_api(system_prompt: str, user_prompt: str, model_name: str | None = None) -> str:
     """
-    توليد إجابة باستخدام Hugging Face Inference API.
-    يستخدم نقطة النهاية /v1/chat/completions إذا كانت متاحة، وإلا يستخدم /v1/completions.
+    Hugging Face Inference Providers - chat/conversational mode.
+    ?? ?????? text_generation ?? Qwen ??? featherless-ai ??? ??? ???? task mismatch.
     """
-    import json  # للطباعة
     if not _HF_AVAILABLE:
-        raise RuntimeError("مكتبة huggingface_hub غير مثبتة. ثبّتها باستخدام: pip install huggingface-hub")
+        raise RuntimeError("????? huggingface_hub ??? ?????. ?????? ????????: pip install huggingface-hub")
 
-    token = os.getenv("HF_TOKEN")
+    token = (os.getenv("HF_TOKEN") or "").strip()
     if not token:
-        raise RuntimeError("HF_TOKEN غير موجود. ضيفه للـ env أو ملف .env")
+        raise RuntimeError("HF_TOKEN ??? ?????. ???? ??? env ?? ??? .env")
 
-    model = model_name or (_CFG.get("models") or {}).get("hf_model", "Intelligent-Internet/II-Medical-8B-1706")
+    model = model_name or (_CFG.get("models") or {}).get(
+        "hf_model",
+        "Qwen/Qwen2.5-3B-Instruct",
+    )
 
-    client = InferenceClient(model=model, token=token)
+    hf_provider = (os.getenv("HF_PROVIDER") or "featherless-ai").strip()
 
-    # تجهيز الرسائل
     messages = [
-        {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": user_prompt.strip()}
+        {"role": "system", "content": (system_prompt or "").strip()},
+        {"role": "user", "content": (user_prompt or "").strip()},
     ]
 
-    # محاولة استخدام واجهة الدردشة (chat) أولاً
-        # محاولة استخدام واجهة الدردشة (chat) أولاً
+    client_kwargs = {
+        "token": token,
+        "timeout": 120,
+    }
+
+    if hf_provider and hf_provider.lower() != "auto":
+        client_kwargs["provider"] = hf_provider
+
+    client = InferenceClient(**client_kwargs)
+
+    def _clean_hf_output(content: str) -> str:
+        content = (content or "").strip()
+        if not content:
+            return ""
+
+        # ????? ????? ??????? ?? tool traces ?? ??? providers
+        markers = [
+            "\nuser\n",
+            "\nassistant\n",
+            "\nUser:",
+            "\nAssistant:",
+            "<tool_call>",
+            "</tool_call>",
+        ]
+
+        cut_positions = []
+        for marker in markers:
+            idx = content.find(marker)
+            if idx > 0:
+                cut_positions.append(idx)
+
+        if cut_positions:
+            content = content[:min(cut_positions)].strip()
+
+        # ????? ??? ??????? OK ???
+        if "say ok only" in (user_prompt or "").lower() and content.lower().startswith("ok"):
+            return "OK"
+
+        return content.strip()
+
+    def _extract_content(resp) -> str:
+        choices = None
+
+        if isinstance(resp, dict):
+            choices = resp.get("choices")
+        else:
+            choices = getattr(resp, "choices", None)
+
+        if not choices:
+            return ""
+
+        choice0 = choices[0]
+
+        if isinstance(choice0, dict):
+            msg = choice0.get("message") or {}
+        else:
+            msg = getattr(choice0, "message", None)
+
+        if isinstance(msg, dict):
+            content = msg.get("content") or msg.get("reasoning") or ""
+        else:
+            content = (
+                getattr(msg, "content", None)
+                or getattr(msg, "reasoning", None)
+                or ""
+            )
+
+        return _clean_hf_output(content)
+
     try:
-        response = client.chat_completion(
+        resp = client.chat_completion(
+            model=model,
             messages=messages,
             max_tokens=_MAX_NEW,
-            temperature=_TEMP,
-            top_p=_TOP_P,
+            temperature=(_TEMP if _TEMP > 0 else None),
+            top_p=(_TOP_P if _TEMP > 0 else None),
             stop=_STOP,
         )
-        if response and response.choices:
-            msg = response.choices[0].message
-            content = msg.content
-            reasoning = getattr(msg, 'reasoning', None)  # بعض النماذج تضع الإجابة في reasoning
-            
-            if content and content.strip():
-                return content.strip()
-            elif reasoning and reasoning.strip():
-                return reasoning.strip()
-            else:
-                return "No response content from model."
-        else:
-            return "No response from model."
+
+        content = _extract_content(resp)
+        if content:
+            return content
+
+        raise RuntimeError(f"HF chat_completion returned empty content. Raw response: {resp}")
+
+    except TypeError:
+        # ????? ?? providers ?? ??? huggingface_hub ?? ???? ??? ???????????
+        resp = client.chat_completion(
+            model=model,
+            messages=messages,
+            max_tokens=_MAX_NEW,
+        )
+
+        content = _extract_content(resp)
+        if content:
+            return content
+
+        raise RuntimeError(f"HF chat_completion returned empty content. Raw response: {resp}")
+
     except Exception as e:
-        # إذا فشلت chat_completion، نستخدم text_generation
-        try:
-            # بناء prompt بسيط
-            prompt = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
-            response = client.text_generation(
-                prompt,
-                max_new_tokens=_MAX_NEW,
-                temperature=_TEMP,
-                top_p=_TOP_P,
-                stop_sequences=_STOP,
-                do_sample=(_TEMP > 0),
-            )
-            if isinstance(response, str):
-                return response.strip()
-            else:
-                return str(response).strip()
-        except Exception as e2:
-            raise RuntimeError(f"فشل الاتصال عبر text_generation: {e2}")
-        
+        raise RuntimeError(
+            f"HF chat_completion failed for model={model}, provider={hf_provider}: {e}"
+        )
+
+
 # ========== Local (transformers) ==========
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
