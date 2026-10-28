@@ -1,3 +1,10 @@
+
+
+
+
+
+
+
 # -*- coding: utf-8 -*-
 """MedRAG clinical intent/safety descriptor.
 
