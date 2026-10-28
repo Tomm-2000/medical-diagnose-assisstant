@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 # app/rag/build_index.py
 # Build FAISS + optional BM25 from chunk JSON files
