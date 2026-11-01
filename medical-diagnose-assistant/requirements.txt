@@ -1,0 +1,18 @@
+# Direct dependencies used by the supplied source; versions are not locked.
+streamlit
+pandas
+numpy
+joblib
+PyYAML
+faiss-cpu
+rank-bm25
+sentence-transformers
+transformers
+torch
+scikit-learn
+python-dotenv>=1.0.1
+huggingface-hub
+tqdm
+py2neo
+spacy
+scispacy

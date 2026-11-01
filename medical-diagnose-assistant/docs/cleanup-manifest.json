@@ -1,0 +1,73 @@
+{
+  "file_mapping": {
+    "add_stroke_chunks.py": "app/rag/add_stroke_chunks.py",
+    "agent_controller.py": "app/rag/agent_controller.py",
+    "agent_state.py": "app/rag/agent_state.py",
+    "app_streamlit.py": "app_streamlit.py",
+    "build_bm25.py": "app/rag/build_bm25.py",
+    "build_graph.py": "app/rag/build_graph.py",
+    "build_index.py": "app/rag/build_index.py",
+    "clinical_context.py": "app/rag/clinical_context.py",
+    "clinical_intent.py": "app/rag/clinical_intent.py",
+    "clinical_signals.py": "app/rag/clinical_signals.py",
+    "common_utils.py": "app/rag/common_utils.py",
+    "config.yaml": "config.yaml",
+    "evidence_judge.py": "app/rag/evidence_judge.py",
+    "explainability.py": "app/rag/explainability.py",
+    "graph_retriever.py": "app/rag/graph_retriever.py",
+    "hybrid_feedback.py": "app/rag/hybrid_feedback.py",
+    "kg_summary.py": "app/rag/kg_summary.py",
+    "llm.py": "app/models/llm.py",
+    "medcpt_reranker.py": "app/models/medcpt_reranker.py",
+    "pipeline.py": "app/rag/pipeline.py",
+    "PROJECT OF END.pdf": "docs/reports/PROJECT OF END.pdf",
+    "prompts.py": "app/rag/prompts.py",
+    "retriever.py": "app/rag/retriever.py",
+    "stroke_rf_pipeline.joblib": "models/stroke_rf_pipeline.joblib",
+    "stroke_risk.py": "app/models/stroke_risk.py",
+    "tools.py": "app/rag/tools.py",
+    "utils_text.py": "app/rag/utils_text.py",
+    "التقرير النهائي.pdf": "docs/reports/التقرير النهائي.pdf"
+  },
+  "removed": {
+    ",,,": "One-byte stray file with no code references"
+  },
+  "source_changes": [
+    "app_streamlit.py: align bundled model path, consistent project title, handle empty/invalid features JSON, remove training controls referencing absent train_stroke_rf.py"
+  ],
+  "preservation": {
+    "app/rag/add_stroke_chunks.py": "9c256e87c8af4c6a015389a8a737ca75ff6336195fb997b5b6d9b4a7daab9d30",
+    "app/rag/agent_controller.py": "e7ba00360c7601d6714c7e33612ae6390a789dfaebbba67dc03db6a0bb685bc9",
+    "app/rag/agent_state.py": "1bbcde234e217627c4a9dcb87b68606f6eebf729691afdf87f77f19e43be9c7f",
+    "app/rag/build_bm25.py": "0150a33b4e285e745db33bafcf8cd55280b6e654aa4ea9768f59e2a5e5076c12",
+    "app/rag/build_graph.py": "4e9a317c3c9cef5e8de499bade2fef8e0ea775d3f6fdbabc7bd9e21251d2c710",
+    "app/rag/build_index.py": "9194c9fb1336edd46d48f182a897b311a37322d31fe94d82d524059edeb4b907",
+    "app/rag/clinical_context.py": "afbaad922b2e0c3d4dcd751f6d52f0f8562b6523d731c335322c1bfb288de7c2",
+    "app/rag/clinical_intent.py": "19823f725c70cd6aa3972d2b4a3da1b5efa7d5bf06daf399b2b6859161f96ce2",
+    "app/rag/clinical_signals.py": "a229252c692b2ca999f1f13c8041468a41ff061d2768316861203130a5a659f5",
+    "app/rag/common_utils.py": "8636da9167bd57f960f4b6644f1628d0b4f6b883a2c7a799de57411827ff5e19",
+    "app/rag/evidence_judge.py": "d7323ea6e6e263253289a85e8995d5555b9718a63ab30b7f4632b0d0aa4ab681",
+    "app/rag/explainability.py": "2ef61ade020b53d9b062b6fd40804154fa1b0a6dfcfd38c0244c974d0471d4f9",
+    "app/rag/graph_retriever.py": "668ed4510d2eb7347e4fd13327ff0f572a0b11c05755bc59c4c5b243a1774049",
+    "app/rag/hybrid_feedback.py": "d90c8048b43b2239713b906cde248b7a7c220ca02b86dc7b89dee3aba4d4e875",
+    "app/rag/kg_summary.py": "ed38c36d30235a389f987503dc11b707efe74f171f910fe69bb98e9a3e73ecd4",
+    "app/models/llm.py": "7a00fc83ab15a6fdee765acd8bd887d0ea574205d50d1b1ea8fbce1231cdcde6",
+    "app/models/medcpt_reranker.py": "fadf692fd123fe8a2b5b91f0e5de23a03acf5a4249aeab9e11d6c31211106174",
+    "app/rag/pipeline.py": "d84ca2d3e7dfed6c8534aaeecdaf308cc96911c4a564a334d4daed2ed77cdedc",
+    "docs/reports/PROJECT OF END.pdf": "84d939881255dffce6cb5fcc2de1e041971cbd7c1ca9acecc6e9a4563e5ed1c4",
+    "app/rag/prompts.py": "a65f782174785024e4b698b62e0be4133b400b3d8c15c8ef2317df65357dc851",
+    "app/rag/retriever.py": "19aa16d47cdfd8c93f0f9d73811d7ddd5dba1feaff2f3b4786f29ae7632776f8",
+    "models/stroke_rf_pipeline.joblib": "56167d018ba6f0bd7d7daf094d7b12b7f5729844f18665715b87a5b6bba825ce",
+    "app/models/stroke_risk.py": "24ede1087911b519352450fd066683dbf87f58141d923f51137737f6850a2ecb",
+    "app/rag/tools.py": "99896e8b6b994029853b87f1e0b9b3773d8df62fb480f5f8d5ec387c0f1a77f9",
+    "app/rag/utils_text.py": "a0c5588909626d02e0b4356307dfefba7fc0e077c3f635e6edda0152091d5a91",
+    "docs/reports/التقرير النهائي.pdf": "e2d95d12765ce03f84cc2f4912c681ec5faf416491a841b8160b8acc4e60d949"
+  },
+  "validation": {
+    "python_syntax": "All Python files parsed successfully",
+    "preservation": "All core Python modules, both reports and pretrained model are byte-identical",
+    "runtime": "Not run: corpus, indexes, Neo4j service and external models are not supplied",
+    "focused_checks": "PASS: all Python syntax, local import targets, context/intent module smoke checks, four patient JSON cases, model path and preservation hashes"
+  },
+  "added_compatibility": "app/knowledge_graph/graph_retriever.py re-exports app.rag.graph_retriever.GraphRetriever"
+}

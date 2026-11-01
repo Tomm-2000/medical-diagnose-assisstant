@@ -1,0 +1,56 @@
+
+app:
+  project_name: "Med-RAG"
+  debug: true
+
+kb:
+  chunk_size: 1000          # زيادة حجم القطعة لتحسين السياق
+  chunk_overlap: 200        # تداخل مناسب
+
+retrieval:
+  top_k_dense: 50
+  top_k_bm25: 50
+  top_k_merged: 30
+  max_docs_for_llm: 8       # تقليل العدد لأن القطع أكبر
+  max_context_chars: 6000   # زيادة الحد الأقصى
+  use_bm25: true
+  w_dense: 0.7
+  w_bm25: 0.3
+  use_reranker: true
+  reranker_model: "ncbi/MedCPT-Cross-Encoder"   # نموذج طبي متخصص
+
+models:
+  llm_provider: "hf_api"
+  llm_model: "Qwen/Qwen2.5-3B-Instruct"   # استخدم النموذج المناسب
+  openai_model: "gpt-4o-mini"
+  embeddings: "ncbi/MedCPT-Article-Encoder"      # نموذج تضمين طبي
+  use_normalizer: null
+
+generation:
+  temperature: 0.0
+  max_new_tokens: 512
+  repetition_penalty: 1.05
+  stop:
+    - "<|im_end|>"
+    - "</s>"
+    - "<|endoftext|>"
+
+pubmed:
+  enable: false
+  retmax: 8
+  years_back: 10
+  merge_with_local_kb: true
+
+knowledge_graph:
+  enabled: true
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "password"
+  use_hybrid_search: true
+  graph_weight: 0.3
+
+paths:
+  bm25_index: "app/index/bm25.joblib"
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  indices: "data/indices"
